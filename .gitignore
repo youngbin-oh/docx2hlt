@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+
+# conversion inputs/outputs — patent drafts are confidential, never commit them
+*.docx
+*.hlt
+*.HLT
+*.hbk
+*.HBK
+*.rtf
+*.RTF
+*.charset.txt
+*.xml
+*.jpg
+*.tif
+*.tiff
