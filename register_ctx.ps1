@@ -1,4 +1,4 @@
-# Registers a right-click "HLT 파일로 변환" verb for .docx files.
+﻿# Registers a right-click "HLT 파일로 변환" verb for .docx files.
 # Re-run this if you move the docx2hlt folder. No admin needed (HKCU).
 $base = 'HKCU:\Software\Classes\SystemFileAssociations\.docx\shell\DocxToHlt'
 $cmd  = 'cmd.exe /c ""' + $PSScriptRoot + '\docx2hlt_ctx.cmd" "%1""'

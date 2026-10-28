@@ -8,7 +8,9 @@ title docx2hlt
 echo Converting:
 for %%A in (%*) do echo   %%~A
 echo.
-python "%~dp0docx2hlt.py" %*
+rem --pause-on-review-error: python itself waits for Enter when the .hlt was
+rem made but its .rtf / .compare.docx review files were not
+python "%~dp0docx2hlt.py" --pause-on-review-error %*
 if errorlevel 1 (
   echo.
   echo *** CONVERSION FAILED ***

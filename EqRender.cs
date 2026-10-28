@@ -124,7 +124,7 @@ internal static class EqRender
                     }
                     string tif = Path.Combine(outdir, string.Format("eq{0:D4}.tif", i));
                     float wmm, hmm;
-                    SaveTrimmedTiff(emf, tif, out wmm, out hmm);
+                    SaveTrimmedTiff(UnclipEquationEmf(emf), tif, out wmm, out hmm);
                     map.WriteLine(i + "\t" + Mm(wmm) + "\t" + Mm(hmm));
                     rendered++;
                 }
@@ -285,6 +285,99 @@ internal static class EqRender
         {
             CloseClipboard();
         }
+    }
+
+    // --- equation EMF unclip ----------------------------------------------
+
+    private const uint EMR_EXTTEXTOUTA = 83;
+    private const uint EMR_EXTTEXTOUTW = 84;
+    private const uint EMR_EOF = 14;
+    private const uint ETO_CLIPPED = 0x4;
+
+    // Word's CopyAsPicture of an OMath gives a picture one text line tall
+    // (18pt) and draws every glyph with ETO_CLIPPED to that line box, so a
+    // fraction's numerator top and its whole denominator are cut off even
+    // though their text records are in the EMF. Clear ETO_CLIPPED on the text
+    // records and grow the header's bounds/frame vertically to cover every
+    // non-blank text baseline (plus one line of margin each side); the
+    // render is trimmed afterwards anyway. Tables are not touched — their
+    // per-cell text clipping is real.
+    private static byte[] UnclipEquationEmf(byte[] src)
+    {
+        if (src == null || src.Length < 88 || BitConverter.ToUInt32(src, 0) != 1)
+        {
+            return src;
+        }
+        byte[] emf = (byte[])src.Clone();
+        int bTop = BitConverter.ToInt32(emf, 12), bBottom = BitConverter.ToInt32(emf, 20);
+        int fTop = BitConverter.ToInt32(emf, 28), fBottom = BitConverter.ToInt32(emf, 36);
+        int devY = BitConverter.ToInt32(emf, 76), mmY = BitConverter.ToInt32(emf, 84);
+        if (devY <= 0 || mmY <= 0)
+        {
+            return src;
+        }
+        double hmmPerPx = mmY * 100.0 / devY;            // frame unit: 0.01 mm
+        int lineH = Math.Max(1, (int)Math.Round((fBottom - fTop) / hmmPerPx));
+        int minY = int.MaxValue, maxY = int.MinValue;
+
+        int off = 0;
+        while (off + 8 <= emf.Length)
+        {
+            uint type = BitConverter.ToUInt32(emf, off);
+            int size = BitConverter.ToInt32(emf, off + 4);
+            if (size < 8 || off + size > emf.Length || type == EMR_EOF)
+            {
+                break;
+            }
+            if ((type == EMR_EXTTEXTOUTW || type == EMR_EXTTEXTOUTA) && size >= 76)
+            {
+                // EMRTEXT at +36: ptlReference(x,y) nChars offString options rcl offDx
+                int y = BitConverter.ToInt32(emf, off + 40);
+                int nChars = BitConverter.ToInt32(emf, off + 44);
+                int offString = BitConverter.ToInt32(emf, off + 48);
+                uint options = BitConverter.ToUInt32(emf, off + 52);
+                BitConverter.GetBytes(options & ~ETO_CLIPPED).CopyTo(emf, off + 52);
+                if (!IsBlankText(emf, off + offString, nChars, type == EMR_EXTTEXTOUTW))
+                {
+                    minY = Math.Min(minY, y);
+                    maxY = Math.Max(maxY, y);
+                }
+            }
+            off += size;
+        }
+        if (minY == int.MaxValue)
+        {
+            return emf;
+        }
+        // baselines -> glyph extent: one line height above the top baseline
+        // and below the bottom one is ample for ascenders/descenders. (Word's
+        // equation EMFs are MM_TEXT with origin 0, so the logical baselines
+        // are already in the header's device units.)
+        int newTop = Math.Min(bTop, minY - lineH);
+        int newBottom = Math.Max(bBottom, maxY + lineH);
+        BitConverter.GetBytes(newTop).CopyTo(emf, 12);
+        BitConverter.GetBytes(newBottom).CopyTo(emf, 20);
+        BitConverter.GetBytes(fTop - (int)Math.Round((bTop - newTop) * hmmPerPx)).CopyTo(emf, 28);
+        BitConverter.GetBytes(fBottom + (int)Math.Round((newBottom - bBottom) * hmmPerPx)).CopyTo(emf, 36);
+        return emf;
+    }
+
+    private static bool IsBlankText(byte[] emf, int at, int nChars, bool wide)
+    {
+        int width = wide ? 2 : 1;
+        if (nChars <= 0 || at < 0 || at + nChars * width > emf.Length)
+        {
+            return true;
+        }
+        for (int i = 0; i < nChars; i++)
+        {
+            int c = wide ? BitConverter.ToUInt16(emf, at + 2 * i) : emf[at + i];
+            if (!char.IsWhiteSpace((char)c))
+            {
+                return false;
+            }
+        }
+        return true;
     }
 
     // --- render + trim + save ----------------------------------------------

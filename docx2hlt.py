@@ -898,6 +898,38 @@ def canon_xml_section(text):
     return None
 
 
+def split_glued_headings(paras):
+    """Split paragraphs where a patent 【section】 marker is glued to body
+    text. A 【…】 that canonizes to a section is a heading even without the
+    line break around it ("...한다.【대표도】" or "【대표도】도 6"): unsplit,
+    it degrades to plain […] via unmark() and the section is silently lost —
+    a missing 【대표도】 then makes the abstract pick a wrong default figure.
+    (runs, images, pp) tuples; an image follows the fragment holding its
+    anchor offset."""
+    out = []
+    for runs, images, pp in paras:
+        text = ''.join(r[0] for r in runs)
+        pts = [(m.start(), m.end()) for m in re.finditer(r'【[^【】]*】', text)
+               if canon_xml_section(m.group(0)) is not None
+               or canon_element(m.group(0)) is not None]
+        if not pts:
+            out.append((runs, images, pp))
+            continue
+        bounds = sorted({0, len(text)} | {p for ab in pts for p in ab})
+        for a, b in zip(bounds, bounds[1:]):
+            sub, off = [], 0
+            for text2, m, sz, c in runs:
+                n = off + len(text2)
+                lo, hi = max(off, a), min(n, b)
+                if hi > lo:
+                    sub.append((text2[lo - off:hi - off], m, sz, c))
+                off = n
+            imgs = [(t, cx, cy, p - a) for t, cx, cy, p in images
+                    if a <= p < b or (b == len(text) and p == len(text))]
+            out.append((sub, imgs, pp))
+    return out
+
+
 def _esc(s):
     return (s.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;'))
 
@@ -1404,6 +1436,21 @@ EQRENDER = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 
 
 WARNINGS = []             # conversion-level problems for the review report
+REVIEW_ISSUES = []        # why .rtf / .compare.docx were not produced
+
+
+def _decode_output(b):
+    """Child-process output -> str. DocCmp's .NET console writes UTF-8 or
+    CP949 depending on the parent console's code page, so decoding with the
+    locale codec alone raises on Korean paths."""
+    if not b:
+        return ''
+    for enc in ('utf-8', 'cp949'):
+        try:
+            return b.decode(enc)
+        except UnicodeDecodeError:
+            pass
+    return b.decode('utf-8', errors='replace')
 
 
 def render_objects(src, imgdir):
@@ -1622,42 +1669,72 @@ def make_review(src, dst):
       - Word-compare  src.docx  vs  that .rtf  into  <stem>.compare.docx
         (tracked-changes document — every dropped/substituted char and
         lost formatting shows up as a revision).
-    Failures are reported but never fail the conversion."""
+    Failures never fail the conversion; they are printed and recorded in
+    REVIEW_ISSUES. If NKEditor crashes under the rtf export, it is retried
+    once.
+
+    NKEditor 6.3 (2026.10.22.01) dies with heap corruption (0xc0000374)
+    while saving RTF when the .hlt it opened has a long path — reproduced
+    at 146+ CP949 bytes (a case-folder Sent path is ~150), never at 44-136.
+    So the export opens a byte-identical copy under a short temp path; the
+    rtf still reflects the saved .hlt file, not the import session."""
     import nkwin
     import shutil
     base = os.path.splitext(dst)[0]
     rtfdst = base + '.rtf'
     cmpdoc = base + '.compare.docx'
+
+    def issue(msg):
+        print('review: ' + msg, file=sys.stderr)
+        REVIEW_ISSUES.append(msg)
+
+    # unique stem: a same-named rtf left in the dialog's folder by an
+    # earlier crashed run would trip nkwin's foreign-file guard
+    tmpdir = tempfile.mkdtemp(prefix='d2hr')
+    probe = os.path.join(tmpdir, 'd2h_%s.hlt' % os.urandom(3).hex())
     try:
-        rtf = nkwin.nk_export_rtf(dst)
-    except Exception as e:
-        print('review: rtf export failed (%r)' % e, file=sys.stderr)
-        return
-    if not rtf or not os.path.exists(rtf):
-        print('review: rtf export produced nothing — skipping compare',
-              file=sys.stderr)
-        return
-    if os.path.abspath(rtf) != os.path.abspath(rtfdst):
-        # the save-as dialog's last-used dir can redirect the export
+        shutil.copyfile(dst, probe)
+        rtf = None
+        for attempt in (1, 2):
+            try:
+                rtf = nkwin.nk_export_rtf(probe)
+                why = nkwin.LAST_EXPORT_ERROR
+                crashed = nkwin.LAST_EXPORT_CRASHED
+            except Exception as e:
+                rtf, why, crashed = None, repr(e), False
+            if rtf and os.path.exists(rtf):
+                break
+            if attempt == 1 and crashed:
+                print('review: rtf export - %s; retrying once' % why,
+                      file=sys.stderr)
+                time.sleep(3)      # let WER finish with the dead instance
+                continue
+            issue('rtf 내보내기 실패 - %s%s'
+                  % (why or 'rtf 파일이 만들어지지 않음',
+                     ' (재시도 후에도 실패)' if attempt == 2 else ''))
+            return
+        # the save-as dialog's last-used dir decides where NKEditor writes
         # (e.g. the user's Desktop) — move it, don't leave litter behind
         shutil.move(rtf, rtfdst)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
     fix_rtf(rtfdst)
     print('review: rtf ->', rtfdst)
     if not os.path.exists(DOCCMP):
-        print('review: DocCmp.exe missing — skipping compare',
-              file=sys.stderr)
+        issue('비교 문서 생성 불가 - DocCmp.exe 없음')
         return
     try:
         for cand in (cmpdoc, base + '.compare-new.docx'):
             r = subprocess.run([DOCCMP, src, rtfdst, cand],
-                               capture_output=True, text=True, timeout=300)
+                               capture_output=True, timeout=300)
             if r.returncode == 0 and os.path.exists(cand):
                 print('review: compare doc ->', cand)
                 return
-        print('review: compare failed (%s)'
-              % (r.stderr or r.stdout or '').strip()[-200:], file=sys.stderr)
+        issue('비교 문서 생성 실패 - %s'
+              % (_decode_output(r.stderr) or _decode_output(r.stdout)
+                 ).strip()[-200:])
     except Exception as e:
-        print('review: compare failed (%r)' % e, file=sys.stderr)
+        issue('비교 문서 생성 실패 - %r' % e)
 
 
 def convert_one(src, dst, force_flat=False):
@@ -1665,8 +1742,10 @@ def convert_one(src, dst, force_flat=False):
     imgdir = tempfile.mkdtemp(prefix='d2h_img')
     CHAR_REPORT.clear()
     del WARNINGS[:]
+    del REVIEW_ISSUES[:]
     eqs, tbls = render_objects(src, imgdir)
     paras, imgfiles = parse_docx(src, imgdir, eqs, tbls)
+    paras = split_glued_headings(paras)
 
     if CHAR_REPORT or WARNINGS:
         # human-review trail: conversion warnings + every unsupported char
@@ -1748,8 +1827,18 @@ def convert_one(src, dst, force_flat=False):
 
 
 def main():
+    # console is cp949 on stock Korean Windows — non-representable chars in
+    # log messages (em dash, …) must not crash the run mid-conversion
+    for s in (sys.stdout, sys.stderr):
+        try:
+            s.reconfigure(errors='replace')
+        except Exception:
+            pass
     args = [a for a in sys.argv[1:] if not a.startswith('--')]
     force_flat = '--flat' in sys.argv[1:]
+    # the Explorer right-click wrapper passes this: its console closes on its
+    # own after a successful conversion, which hid every review failure
+    pause_on_review = '--pause-on-review-error' in sys.argv[1:]
     if not args:
         print('usage: docx2hlt.py input.docx [output.hlt] [more.docx ...]')
         print('  output omitted -> <input>.hlt written next to each input')
@@ -1763,6 +1852,8 @@ def main():
         jobs = [(a, os.path.splitext(os.path.abspath(a))[0] + '.hlt')
                 for a in args]
     rc = 0
+    review_failed = []
+    stale_views = []
     for src, dst in jobs:
         if len(jobs) > 1:
             print('=== %s' % src)
@@ -1773,6 +1864,41 @@ def main():
             r = 1
         if r:
             rc = r
+        elif REVIEW_ISSUES:
+            review_failed.append((src, list(REVIEW_ISSUES)))
+        # an editor the user already had open on the output still shows the
+        # old document; saving there would overwrite the new .hlt
+        if not r:
+            try:
+                import nkwin
+                pids = nkwin.editors_showing(dst)
+            except Exception:
+                pids = []
+            if pids:
+                stale_views.append((dst, pids))
+    if review_failed:
+        print()
+        print('*** .hlt는 만들어졌지만 검토 파일(.rtf/.compare.docx)을 '
+              '만들지 못했습니다 ***')
+        for src, issues in review_failed:
+            print('  %s' % os.path.basename(src))
+            for msg in issues:
+                print('    - %s' % msg)
+    if stale_views:
+        print()
+        print('*** 이미 열려 있던 NKEditor 창이 변환 전 .hlt를 보여 주고 '
+              '있습니다 ***')
+        for dst, pids in stale_views:
+            print('  %s (NKEditor PID %s)'
+                  % (os.path.basename(dst), ', '.join(map(str, pids))))
+        print('  그 창에서 저장하면 새 .hlt를 덮어씁니다. 저장하지 말고 닫은 뒤 '
+              '다시 여세요.')
+    if review_failed or stale_views:
+        if pause_on_review:
+            try:
+                input('\nEnter 키를 누르면 창이 닫힙니다...')
+            except EOFError:
+                pass
     return rc
 
 

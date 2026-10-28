@@ -41,12 +41,89 @@ def _log(msg):
 NK_EXE = r'C:\KipoNet\NKEditor\NKEditor.exe'
 NK_HLT_DIR = r'C:\KipoNet\NKEditor\Data\Hlt'
 
+# Why the last nk_export_rtf() returned None (None after a success), and
+# whether NKEditor died under it — the caller retries only a crash
+# (heap-corruption exits were seen right after an NKEditor auto-update).
+LAST_EXPORT_ERROR = None
+LAST_EXPORT_CRASHED = False
+
 
 def _wpid(h):
     """PID that owns window `h`."""
     pid = wintypes.DWORD()
     _user.GetWindowThreadProcessId(h, ctypes.byref(pid))
     return pid.value
+
+
+def _launch(path):
+    """Start a private NKEditor on `path`, minimized and without activation.
+    NKEditor 6.3 is not single-instance - every launch is a new process with
+    its own frame - so a normal launch pops a second editor window over the
+    one the user already has open. Everything here is message-driven, so the
+    minimized frame (and its unfocused Save-As dialog) works the same."""
+    si = subprocess.STARTUPINFO()
+    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    si.wShowWindow = 7                       # SW_SHOWMINNOACTIVE
+    return subprocess.Popen([NK_EXE, path], startupinfo=si)
+
+
+def _exe_name(pid):
+    k32 = ctypes.windll.kernel32
+    h = k32.OpenProcess(0x1000, False, pid)   # QUERY_LIMITED_INFORMATION
+    if not h:
+        return ''
+    try:
+        buf = ctypes.create_unicode_buffer(520)
+        n = wintypes.DWORD(520)
+        if k32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(n)):
+            return os.path.basename(buf.value)
+        return ''
+    finally:
+        k32.CloseHandle(h)
+
+
+def _cmdlines(pids):
+    """{pid: command line} via CIM (one PowerShell call)."""
+    if not pids:
+        return {}
+    flt = ' or '.join('ProcessId=%d' % p for p in pids)
+    r = subprocess.run(
+        ['powershell', '-NoProfile', '-Command',
+         '[Console]::OutputEncoding=[Text.Encoding]::UTF8; '
+         'Get-CimInstance Win32_Process -Filter "%s" | '
+         '%% { "$($_.ProcessId)|$($_.CommandLine)" }' % flt],
+        capture_output=True, timeout=30)
+    out = {}
+    for line in r.stdout.decode('utf-8', 'replace').splitlines():
+        p, _, cmd = line.partition('|')
+        if p.strip().isdigit():
+            out[int(p)] = cmd
+    return out
+
+
+def editors_showing(path):
+    """PIDs of running NKEditor frames whose document is `path`. The frame
+    title ends in '[<doc path>]' but NKEditor cuts long paths short, so a
+    cut title only counts when the process was also launched on `path`.
+    (On a host whose ANSI codepage is not Korean, Korean title text reads
+    back as '?' and nothing matches.)"""
+    want = os.path.abspath(path).lower()
+    full, cut = [], []
+    t = ctypes.create_unicode_buffer(1024)
+    for h, cn, _t, p in _top_windows():
+        if not cn.startswith('Afx:') or p in full or p in cut:
+            continue
+        _user.GetWindowTextW(h, t, 1024)
+        m = re.search(r'\[([^\]]+)\]?\s*$', t.value)
+        if not m or _exe_name(p).lower() != 'nkeditor.exe':
+            continue
+        shown = m.group(1).strip().lower()
+        if shown == want:
+            full.append(p)
+        elif len(shown) >= 12 and want.startswith(shown):
+            cut.append(p)
+    cmds = _cmdlines(cut)
+    return full + [p for p in cut if want in cmds.get(p, '').lower()]
 
 
 def _top_windows():
@@ -404,7 +481,7 @@ def nk_import_and_save_hlt(xml_path, base_name, launch_timeout=45,
             pass
 
     _log('launching NKEditor on %s' % xml_path)
-    proc = subprocess.Popen([NK_EXE, xml_path])
+    proc = _launch(xml_path)
     pid = proc.pid
     _log('nk pid=%d' % pid)
 
@@ -417,8 +494,9 @@ def nk_import_and_save_hlt(xml_path, base_name, launch_timeout=45,
         _dismiss_nk_dialogs(pid, prefer='no')   # skip crash-recovery prompts
         hwnd = _find_nk_window(pid, xbase) or _find_nk_window(pid)
         if not hwnd and time.time() - t0 > 6:
-            # NKEditor is single-instance: if it's already running our Popen'd
-            # launcher hands the file to the existing process, so the new doc
+            # Older NKEditor builds were single-instance (6.3 starts a new
+            # process per launch): if it was already running, our Popen'd
+            # launcher handed the file to the existing process, so the new doc
             # window belongs to a *different* pid. Fall back to matching the
             # filename in the title across every NKEditor process — and
             # dismiss that pid's prompts too (a crash-recovery dialog on the
@@ -450,9 +528,17 @@ def nk_import_and_save_hlt(xml_path, base_name, launch_timeout=45,
     # them (prefer '아니요' — we want the file we opened, not a recovered one).
     loaded = None
     t0 = time.time()
+    tbuf = ctypes.create_unicode_buffer(512)
     while time.time() - t0 < launch_timeout and not loaded:
         _dismiss_nk_dialogs(pid, prefer='no')
         if _tree_item_count(hwnd) > 2:
+            loaded = True
+            break
+        # v6.3 keeps the structure pane collapsed and the tree empty even
+        # with the document fully imported — the frame title gaining the
+        # [path] suffix is the only load marker there.
+        _user.GetWindowTextW(hwnd, tbuf, 512)
+        if '[' in tbuf.value:
             loaded = True
             break
         time.sleep(0.5)
@@ -463,11 +549,12 @@ def nk_import_and_save_hlt(xml_path, base_name, launch_timeout=45,
     # posted straight to the frame. This is deterministic — it needs no input
     # focus and is unaffected by overlapping (remote-desktop) windows, unlike
     # screen-coordinate clicks on the quick-access ribbon icon. Retry a few
-    # times in case the doc is still settling.
+    # times in case the doc is still settling. The shell dialog can take
+    # ~7 s to materialize on a slow host, so each attempt waits a while.
     dlg = None
     for _attempt in range(6):
         _user.PostMessageW(hwnd, 0x0111, 0xE104, 0)   # WM_COMMAND SAVE_AS
-        dlg = _wait_for(lambda: _find_saveas_dialog(pid), 5)
+        dlg = _wait_for(lambda: _find_saveas_dialog(pid), 12)
         _log('save-as attempt %d -> dlg %s'
              % (_attempt, hex(dlg) if dlg else None))
         if dlg:
@@ -510,10 +597,15 @@ def nk_import_and_save_hlt(xml_path, base_name, launch_timeout=45,
         # When the dialog shows a library ('문서') rather than a real path,
         # _dialog_dir can't resolve it — so sweep every plausible folder by
         # name+recency instead of trusting one source.
+        # dlg_dir too: once the dialog has closed it can't be re-read, and
+        # its last-used folder (another case's Sent, say) is where the file
+        # actually lands
         dirs = {out_dir, NK_HLT_DIR, os.path.dirname(xml_path),
                 os.path.expanduser('~\\Documents'),
                 os.path.expanduser('~\\Desktop'),
                 os.path.expanduser('~\\Downloads')}
+        if dlg_dir:
+            dirs.add(dlg_dir)
         dd = _dialog_dir(_find_saveas_dialog(pid) or dlg)
         if dd:
             dirs.add(dd)
@@ -626,14 +718,39 @@ def nk_export_rtf(hlt_path, launch_timeout=45, save_timeout=30):
     (file-type combo -> 'RTF(*.RTF)'). Returns the produced .rtf path or None.
     Used so a docx2hlt run can offer a Word-comparable view of what actually
     landed in the .hlt."""
+    global LAST_EXPORT_ERROR, LAST_EXPORT_CRASHED
+    LAST_EXPORT_ERROR = None
+    LAST_EXPORT_CRASHED = False
     hlt_path = os.path.abspath(hlt_path)
     base_name = os.path.splitext(os.path.basename(hlt_path))[0]
     t0_launch = time.time()
 
     _log('export-rtf: launching NKEditor on %s' % hlt_path)
-    proc = subprocess.Popen([NK_EXE, hlt_path])
+    proc = _launch(hlt_path)
     pid = proc.pid
     hwnd = None
+
+    def _dead():
+        # the frame vanished without our WM_CLOSE, or the process we launched
+        # exited non-zero (a single-instance handoff exits 0 — not a crash)
+        if hwnd and not _user.IsWindow(hwnd):
+            return True
+        return proc.poll() not in (None, 0)
+
+    def _fail(msg, crashed=False):
+        global LAST_EXPORT_ERROR, LAST_EXPORT_CRASHED
+        LAST_EXPORT_CRASHED = crashed
+        LAST_EXPORT_ERROR = ('NKEditor 비정상 종료 (%s)' % msg) if crashed \
+            else msg
+        _log('export-rtf: %s' % LAST_EXPORT_ERROR)
+        # an early bail-out must not leave our own editor window behind
+        if hwnd and pid == proc.pid and _user.IsWindow(hwnd):
+            try:
+                _user.PostMessageW(hwnd, 0x0010, 0, 0)   # WM_CLOSE
+                _close_with_prompts(pid, hwnd)
+            except Exception:
+                pass
+        return None
     t0 = time.time()
     while time.time() - t0 < launch_timeout and not hwnd:
         _dismiss_nk_dialogs(pid, prefer='no')
@@ -650,23 +767,29 @@ def nk_export_rtf(hlt_path, launch_timeout=45, save_timeout=30):
                     _dismiss_nk_dialogs(p, prefer='no')
         time.sleep(0.4)
     if not hwnd:
-        _log('export-rtf: no window')
-        return None
+        return _fail('NKEditor 창이 뜨지 않음', _dead())
     pid = _wpid(hwnd)
-    # give the doc a moment to finish loading (no element-tree wait — an
-    # existing .hlt opens quickly)
-    time.sleep(3)
+    # wait for the doc to finish loading — the frame title gains the
+    # [path] suffix once the file is fully open. A fresh launch can take
+    # 25-30 s on a slow machine; SAVE_AS posted before that is swallowed.
+    t0 = time.time()
+    while time.time() - t0 < launch_timeout:
+        tt = ctypes.create_unicode_buffer(512)
+        _user.GetWindowTextW(hwnd, tt, 512)
+        if '[' in tt.value:
+            break
+        _dismiss_nk_dialogs(pid, prefer='no')
+        time.sleep(0.4)
 
     dlg = None
     for _attempt in range(6):
         _user.PostMessageW(hwnd, 0x0111, 0xE104, 0)   # WM_COMMAND SAVE_AS
-        dlg = _wait_for(lambda: _find_saveas_dialog(pid), 5)
+        dlg = _wait_for(lambda: _find_saveas_dialog(pid), 12)
         if dlg:
             break
         time.sleep(1)
     if not dlg:
-        _log('export-rtf: no save-as dialog')
-        return None
+        return _fail('다른 이름으로 저장 대화상자가 뜨지 않음', _dead())
     time.sleep(0.8)
 
     # switch the file-type combo to RTF — whichever combo exposes an 'RTF'
@@ -683,7 +806,7 @@ def nk_export_rtf(hlt_path, launch_timeout=45, save_timeout=30):
             break
     _log('export-rtf: type=%r' % picked)
     if not picked:
-        return None
+        return _fail('저장 대화상자에 RTF 형식이 없음', _dead())
 
     # type the full output path into the filename field — otherwise the
     # dialog saves into the instance's last-used folder (e.g. the user's
@@ -706,11 +829,11 @@ def nk_export_rtf(hlt_path, launch_timeout=45, save_timeout=30):
             f = f[:-4] + '.RTF'
             foreign = os.path.exists(f) and os.path.getmtime(f) < t0_launch
         if foreign:
-            _log('export-rtf: cancelled — foreign %r' % f)
             cb = _find_button_text(dlg, ('취소', 'Cancel'))
             if cb:
                 _user.SendMessageW(cb, 0x00F5, 0, 0)
-            return None
+            return _fail('저장 폴더에 이전부터 있던 같은 이름의 파일이 있어 '
+                         '덮어쓰지 않음: %s' % f)
 
     btn = _find_save_button(dlg) or _find_button_text(dlg, ('저장', 'Save'))
     if btn:
@@ -746,6 +869,8 @@ def nk_export_rtf(hlt_path, launch_timeout=45, save_timeout=30):
                 break
         if saved:
             break
+        if _dead():
+            break
         _dismiss_nk_dialogs(pid, prefer='yes')
         if not _modal_up(pid):
             for d in _find_saveas_dialogs(pid):
@@ -757,7 +882,12 @@ def nk_export_rtf(hlt_path, launch_timeout=45, save_timeout=30):
                     _user.PostMessageW(d, 0x0111, 1, 0)
         time.sleep(0.8)
 
-    if pid == proc.pid:
+    if not saved:
+        if _dead():
+            _fail('RTF 저장 중', True)
+        else:
+            _fail('%d초 안에 rtf 파일이 생기지 않음' % save_timeout)
+    if pid == proc.pid and _user.IsWindow(hwnd):
         try:
             _user.PostMessageW(hwnd, 0x0010, 0, 0)   # WM_CLOSE our own frame
             _close_with_prompts(pid, hwnd)

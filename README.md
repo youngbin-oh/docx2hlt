@@ -70,6 +70,11 @@ in the same folder. Remove it with `unregister_ctx.ps1`.
   you see the WARNING in the charset report). Without Word/rendering,
   equations degrade to linear text and tables fall back to cell-flattened
   paragraphs.
+  Word's `CopyAsPicture` of an equation is only one text line (18pt)
+  tall and clips every glyph to that line box (`ETO_CLIPPED`), which
+  cut off fraction denominators and numerator tops. EqRender clears
+  that flag on the equation EMF's text records and grows the picture
+  frame to cover all baselines before rasterizing (tables untouched).
   Equation images are keyed by their index in Word's `doc.OMaths`
   (`eqNNNN.tif`), and `docx2hlt.py` numbers the `m:oMath` elements the
   same way (`main_story_omaths`: document order, main story, inside
@@ -131,9 +136,20 @@ not synthesized by hand:
    coordinates, so it survives remote-desktop occlusion and never needs
    input focus — and clicks the dialog's 저장 button (`BM_CLICK`).
    The default save type is already `*.HLT`, so NKEditor writes a real
-   binary `.hlt` under `Data\Hlt`, which is copied to the destination.
+   binary `.hlt` into the dialog's last-used folder (which can be
+   another case's folder), and it is moved from there to the destination.
    If the structured path fails for any reason it falls back to the
    flat path below.
+
+NKEditor 6.3 is not single-instance: every launch is a separate process
+with its own window, even when the user already has NKEditor open. The
+driver therefore starts its own editors minimized without activation
+(`SW_SHOWMINNOACTIVE`), so they do not pop up over the user's window,
+and it never sends anything to an editor it did not start. If an editor
+the user already had open shows the output `.hlt`, that window still
+holds the pre-conversion document; the run says so at the end (and the
+right-click wrapper waits for Enter), because saving there would
+overwrite the new `.hlt`.
 
 ## How it works — flat (non-patent) path
 
@@ -257,6 +273,16 @@ Every conversion additionally produces, next to the `.hlt`:
   formatting loss appear as revisions — replaces the manual
   "save as rtf → 문서 비교" step. Requires Word for the compare step
   only; the `.rtf` is always produced when the structured path ran.
+
+The export opens a byte-identical copy of the `.hlt` under a short temp
+path: NKEditor 6.3 (2026.10.22.01) crashes with heap corruption
+(0xc0000374) while saving RTF when the opened `.hlt` path is long
+(reproduced at 146+ CP949 bytes, e.g. a case folder's `Sent` path; never
+at 44-136). If NKEditor still dies during the export, it is retried once. A
+review-file failure never fails the conversion: the reasons are printed
+at the end of the run, and with `--pause-on-review-error` (the
+right-click wrapper passes it) the window waits for Enter instead of
+closing on its own.
 
 Review workflow: open `.compare.docx` → accept what's fine, fix the
 docx where a substitution is wrong → reconvert. The `.charset.docx`
