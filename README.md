@@ -29,3 +29,7 @@ Python은 설치하지 않아도 됩니다. 배포 파일에 들어 있습니다
 - 변환 중에는 NKEditor와 Word가 자동으로 실행되었다가 닫힙니다. 끝날 때까지 기다리세요.
 
 기술 설명(영문): [docs/TECHNICAL.md](docs/TECHNICAL.md)
+
+## 라이선스
+
+[MIT](LICENSE). 배포 파일에 들어 있는 Python과 Pillow는 각자의 라이선스(`python\LICENSE.txt`, `python\Lib\site-packages\pillow-*.dist-info\licenses\LICENSE`)를 따릅니다.
