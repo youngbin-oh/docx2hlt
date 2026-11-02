@@ -407,6 +407,141 @@ def main_story_omaths(root):
     return out
 
 
+# --- list numbering ----------------------------------------------------------
+# Word list labels (bullets, "1.", "a)") are not text in document.xml - they
+# come from numbering.xml - so they used to vanish (an English PCT spec: "- startPRB",
+# "○ 3", "2."; a domestic spec: 64 "-"/"•" bullets) while the filed .hlt files carry
+# them as text. Paragraph-number lists ("[%1]", "[00%1]" -> [0001]) are
+# skipped: NKEditor numbers paragraphs itself.
+NUMBERING = {}            # per document, filled by parse_docx
+
+BULLET_MAP = {'': '•', '': '■', '': '□', '': '▶',
+              '': '√', '': '―', '': '◆', '': '■',
+              '': '●', '': '→', '': '⇒', 'o': '○',
+              '': '○', '': '•'}
+
+
+def load_numbering(zf, styles):
+    try:
+        root = ET.fromstring(zf.read('word/numbering.xml'))
+    except KeyError:
+        return {}
+    absl = {}                                 # abstractNumId -> {ilvl: lvl}
+    for a in root.findall(W + 'abstractNum'):
+        lv = {}
+        for l in a.findall(W + 'lvl'):
+            def val(tag, d=None):
+                e = l.find(W + tag)
+                return e.get(W + 'val') if e is not None else d
+            lv[int(l.get(W + 'ilvl', '0'))] = {
+                'fmt': val('numFmt', 'decimal'), 'text': val('lvlText', ''),
+                'start': int(val('start', '1') or 1),
+                'suff': val('suff', 'tab')}
+        absl[a.get(W + 'abstractNumId')] = lv
+    nums = {}                                 # numId -> (aid, {ilvl: start})
+    for n in root.findall(W + 'num'):
+        an = n.find(W + 'abstractNumId')
+        if an is None:
+            continue
+        ov = {}
+        for o in n.findall(W + 'lvlOverride'):
+            so = o.find(W + 'startOverride')
+            if so is not None:
+                ov[int(o.get(W + 'ilvl', '0'))] = int(so.get(W + 'val'))
+        nums[n.get(W + 'numId')] = (an.get(W + 'val'), ov)
+    snum = {}                                 # styleId -> (numId, ilvl)
+    for sid, (_props, ppr) in styles.items():
+        np_ = ppr.find(W + 'numPr') if ppr is not None else None
+        if np_ is not None:
+            e = np_.find(W + 'numId')
+            i = np_.find(W + 'ilvl')
+            if e is not None:
+                snum[sid] = (e.get(W + 'val'),
+                             int(i.get(W + 'val')) if i is not None else 0)
+    return {'abs': absl, 'nums': nums, 'snum': snum, 'ctr': {},
+            'started': set()}
+
+
+def _fmt_num(n, fmt):
+    if fmt in ('lowerLetter', 'upperLetter'):
+        s = ''
+        while n > 0:
+            n, r = divmod(n - 1, 26)
+            s = chr(97 + r) + s
+        return s.upper() if fmt == 'upperLetter' else s
+    if fmt in ('lowerRoman', 'upperRoman'):
+        out = ''
+        for v, r in ((1000, 'm'), (900, 'cm'), (500, 'd'), (400, 'cd'),
+                     (100, 'c'), (90, 'xc'), (50, 'l'), (40, 'xl'), (10, 'x'),
+                     (9, 'ix'), (5, 'v'), (4, 'iv'), (1, 'i')):
+            while n >= v:
+                out += r
+                n -= v
+        return out.upper() if fmt == 'upperRoman' else out
+    if fmt == 'ganada' and 1 <= n <= 14:
+        return '가나다라마바사아자차카타파하'[n - 1]
+    if fmt == 'chosung' and 1 <= n <= 14:
+        return 'ㄱㄴㄷㄹㅁㅂㅅㅇㅈㅊㅋㅌㅍㅎ'[n - 1]
+    if fmt == 'decimalEnclosedCircle' and 1 <= n <= 20:
+        return chr(0x2460 + n - 1)
+    if fmt == 'decimalZero':
+        return '%02d' % n
+    return str(n)
+
+
+def list_label(p, styles):
+    """The visible list label of paragraph `p` ('' if none), advancing the
+    document's list counters."""
+    if not NUMBERING:
+        return ''
+    ppr = p.find(W + 'pPr')
+    nid, il = None, 0
+    if ppr is not None:
+        np_ = ppr.find(W + 'numPr')
+        if np_ is not None:
+            e = np_.find(W + 'numId')
+            i = np_.find(W + 'ilvl')
+            nid = e.get(W + 'val') if e is not None else None
+            il = int(i.get(W + 'val')) if i is not None else 0
+        if nid is None:
+            ps = ppr.find(W + 'pStyle')
+            if ps is not None and ps.get(W + 'val') in NUMBERING['snum']:
+                nid, il2 = NUMBERING['snum'][ps.get(W + 'val')]
+                il = il if np_ is not None and np_.find(W + 'ilvl') is not None \
+                    else il2
+    if not nid or nid == '0' or nid not in NUMBERING['nums']:
+        return ''
+    aid, ov = NUMBERING['nums'][nid]
+    lv = NUMBERING['abs'].get(aid, {})
+    if il not in lv:
+        return ''
+    ctr = NUMBERING['ctr'].setdefault(aid, {})
+    if nid not in NUMBERING['started']:
+        NUMBERING['started'].add(nid)
+        for k, v in ov.items():             # "restart numbering" instance
+            ctr[k] = v - 1
+    ctr[il] = ctr.get(il, lv[il]['start'] - 1) + 1
+    for k in [k for k in ctr if k > il]:
+        del ctr[k]
+    lvl = lv[il]
+    text = lvl['text']
+    if '[' in text or '【' in text:
+        return ''                           # paragraph number: NKEditor's job
+    if lvl['fmt'] == 'none':
+        return ''
+    if lvl['fmt'] == 'bullet':
+        label = BULLET_MAP.get(text, text)
+    else:
+        def sub(m):
+            k = int(m.group(1)) - 1
+            f = lv.get(k, lvl)['fmt']
+            return _fmt_num(ctr.get(k, lv.get(k, lvl)['start']), f)
+        label = re.sub(r'%(\d)', sub, text)
+    if not label.strip():
+        return ''
+    return label + ('' if lvl['suff'] == 'nothing' else ' ')
+
+
 def para_runs(p, styles, rels, media, eqs=None):
     """Extract (runs, images, paraProps) from a w:p paragraph element.
     runs: [(text, mask, sizeHalfPt, colorBGR)];
@@ -450,6 +585,22 @@ def para_runs(p, styles, rels, media, eqs=None):
             imd = _find_skip_txbx(node, V + 'imagedata')
             if imd is not None:
                 rid = imd.get(R + 'id')
+            # VML (w:pict, OLE w:object previews such as MathType) carries
+            # its size in the v:shape style, not a wp:extent
+            shp = _find_skip_txbx(node, V + 'shape')
+            if cx is None and shp is not None:
+                st = dict(kv.split(':', 1) for kv in
+                          (shp.get('style') or '').replace(' ', '').split(';')
+                          if ':' in kv)
+
+                def emu(v):
+                    m = re.match(r'^([\d.]+)(pt|in|cm|mm|px)?$', v or '')
+                    if not m:
+                        return None
+                    f = {'pt': 12700, 'in': 914400, 'cm': 360000,
+                         'mm': 36000, 'px': 9525, None: 12700}[m.group(2)]
+                    return int(float(m.group(1)) * f)
+                cx, cy = emu(st.get('width')), emu(st.get('height'))
         if rid and rid in rels:
             tgt = rels[rid]
             if tgt in media:
@@ -493,10 +644,14 @@ def para_runs(p, styles, rels, media, eqs=None):
                 buf.append(' ')
             elif tag == W + 'noBreakHyphen':
                 buf.append('-')
-            elif tag in (W + 'drawing', W + 'pict'):
+            elif tag in (W + 'drawing', W + 'pict', W + 'object'):
+                # w:object = embedded OLE (MathType equations etc.): its VML
+                # preview image is what Word shows - it used to be dropped
+                # without a trace (a domestic spec: 5 inline objects)
                 flush()
                 add_image(ch)
-                walk(ch)                # text-box paragraphs, if any
+                if tag != W + 'object':
+                    walk(ch)            # text-box paragraphs, if any
             elif tag == MC + 'AlternateContent':
                 alt = mc_select(ch)
                 if alt is not None:
@@ -526,6 +681,10 @@ def para_runs(p, styles, rels, media, eqs=None):
             else:
                 walk(ch)
 
+    label = list_label(p, styles)
+    if label and not ''.join(t.text or '' for t in p.iter(W + 't')) \
+            .lstrip().startswith('【'):
+        add_text(label, 0, base[1], base[2])
     walk(p)
     return runs, images, pp
 
@@ -566,6 +725,47 @@ def iter_paragraphs(parent, styles, rels, media, eqs=None,
                 for tc in tr.findall(W + 'tc'):
                     yield from iter_paragraphs(tc, styles, rels, media, eqs,
                                                tbls, tstate, depth + 1)
+
+
+def iter_blocks(parent, styles, rels, media, eqs=None):
+    """Like iter_paragraphs, but a top-level w:tbl stays a table (the
+    의견서 path emits it as a native OASIS table, not an image).
+    Yields ('p', (runs, images, pp)) and ('tbl', {'grid': [dxa..],
+    'rows': [[cell..]..]}); cell = {'paras': [...], 'span': n,
+    'vmerge': None|'restart'|'continue'}. Nested tables flatten into their
+    cell's paragraphs."""
+    for child in parent:
+        if child.tag == W + 'p':
+            yield 'p', para_runs(child, styles, rels, media, eqs)
+        elif child.tag == W + 'sdt':
+            content = child.find(W + 'sdtContent')
+            if content is not None:
+                yield from iter_blocks(content, styles, rels, media, eqs)
+        elif child.tag == W + 'tbl':
+            grid = []
+            tg = child.find(W + 'tblGrid')
+            if tg is not None:
+                for gc in tg.findall(W + 'gridCol'):
+                    v = gc.get(W + 'w') or '0'
+                    grid.append(int(v) if v.isdigit() else 0)
+            rows = []
+            for tr in child.findall(W + 'tr'):
+                cells = []
+                for tc in tr.findall(W + 'tc'):
+                    span, vm = 1, None
+                    tcpr = tc.find(W + 'tcPr')
+                    if tcpr is not None:
+                        gs = tcpr.find(W + 'gridSpan')
+                        if gs is not None and (gs.get(W + 'val') or '').isdigit():
+                            span = max(1, int(gs.get(W + 'val')))
+                        v = tcpr.find(W + 'vMerge')
+                        if v is not None:
+                            vm = v.get(W + 'val') or 'continue'
+                    cells.append({'paras': list(iter_paragraphs(
+                        tc, styles, rels, media, eqs, depth=1)),
+                        'span': span, 'vmerge': vm})
+                rows.append(cells)
+            yield 'tbl', {'grid': grid, 'rows': rows}
 
 
 # --- KIPO structured-document support -------------------------------------
@@ -874,11 +1074,64 @@ BUCKET_TAG = {
 }
 SOI = ('problem', 'solution', 'effects')     # live inside <summary-of-invention>
 
+# 국문 PCT (WIPO ST.36 application-body-v1-6.dtd) differs from PatentCAFDOC:
+# <disclosure> / <mode-for-invention> instead of <summary-of-invention> /
+# <description-of-embodiments>, <abstract> holds <p> directly (no 【요약】,
+# no 대표도), and each <figure> holds exactly one <img>. Headings below
+# override HEAD2XML in the PCT build only, so domestic output is unchanged.
+PCT_HEAD2XML = {
+    '발명의내용': 'disclosure', '발명의상세한설명': 'disclosure',
+    '요약서': 'summary',
+    '발명의실시를위한최선의형태': 'bestmode',
+    '산업상이용가능성': 'industrial',
+}
+PCT_TAG = {
+    'drawdesc': 'description-of-drawings', 'bestmode': 'best-mode',
+    'embodiments': 'mode-for-invention',
+    'industrial': 'industrial-applicability',
+}
 
-def canon_xml_section(text):
+# 영문 PCT (application-body lang="en", PCT명세서(국제출원) 영문서식): the same
+# ST.36 elements under English headings (【Technical Field】, 【Mode for
+# Invention】, 【CLAIMS】, 【Claim 1】, 【Figure 4A】 - the markers of
+# filed English PCT .hlt files). Keys: heading lowercased, spaces and punctuation removed.
+# 【ABSTRACT】 holds the abstract text itself (no 【요약】 sub-item).
+HEAD2XML_EN = {
+    'description': '_root', 'specification': '_root',
+    'inventiontitle': 'title', 'titleofinvention': 'title',
+    'titleoftheinvention': 'title',
+    'technicalfield': 'techfield', 'fieldoftheinvention': 'techfield',
+    'field': 'techfield',
+    'backgroundart': 'background', 'background': 'background',
+    'backgroundoftheinvention': 'background',
+    'disclosure': 'disclosure', 'disclosureofinvention': 'disclosure',
+    'summaryofinvention': 'disclosure', 'summaryoftheinvention': 'disclosure',
+    'technicalproblem': 'problem',
+    'technicalsolution': 'solution', 'solutiontoproblem': 'solution',
+    'advantageouseffects': 'effects',
+    'advantageouseffectsofinvention': 'effects',
+    'descriptionofdrawings': 'drawdesc', 'briefdescriptionofdrawings': 'drawdesc',
+    'briefdescriptionofthedrawings': 'drawdesc',
+    'bestmode': 'bestmode', 'bestmodeforcarryingouttheinvention': 'bestmode',
+    'modeforinvention': 'embodiments', 'modefortheinvention': 'embodiments',
+    'descriptionofembodiments': 'embodiments',
+    'detaileddescription': 'embodiments',
+    'industrialapplicability': 'industrial',
+    'claims': 'claims', 'whatisclaimedis': 'claims',
+    'abstract': 'summary', 'abstractofthedisclosure': 'summary',
+    'drawings': 'drawings', 'figures': 'drawings',
+}
+
+
+def _norm_en(s):
+    return re.sub(r'[^a-z]', '', s.lower())
+
+
+def canon_xml_section(text, en=False):
     """If `text` is a patent 【…】 heading, return (bucket, numstr).
     bucket '' means a pure container heading (no content of its own).
-    numstr is set for 청구항 N / 도 N.  Returns None for non-headings."""
+    numstr is set for 청구항 N / 도 N (Claim N / Figure N with en).
+    Returns None for non-headings."""
     t = text.strip()
     if not t:
         return None
@@ -886,6 +1139,17 @@ def canon_xml_section(text):
     if not m:
         return None
     inner_raw = m.group(1).strip()
+    if en:
+        mnum = re.match(r'^(claim|figure|fig\.?)\s*(\d+)\s*([a-z]?)$',
+                        inner_raw, re.I)
+        if mnum:
+            num = mnum.group(2) + mnum.group(3).upper()
+            return ('claim' if mnum.group(1).lower() == 'claim'
+                    else 'figure', num)
+        key = _norm_en(inner_raw)
+        if key in HEAD2XML_EN:
+            return (HEAD2XML_EN[key], None)
+        return None
     inner = _norm_tag(inner_raw)
     # 청구항 N  /  도 N  carry an index
     mnum = re.match(r'^(청구항|청구|도)\s*(\d+)([a-zA-Z]?)', inner_raw)
@@ -898,7 +1162,7 @@ def canon_xml_section(text):
     return None
 
 
-def split_glued_headings(paras):
+def split_glued_headings(paras, en=False):
     """Split paragraphs where a patent 【section】 marker is glued to body
     text. A 【…】 that canonizes to a section is a heading even without the
     line break around it ("...한다.【대표도】" or "【대표도】도 6"): unsplit,
@@ -910,8 +1174,8 @@ def split_glued_headings(paras):
     for runs, images, pp in paras:
         text = ''.join(r[0] for r in runs)
         pts = [(m.start(), m.end()) for m in re.finditer(r'【[^【】]*】', text)
-               if canon_xml_section(m.group(0)) is not None
-               or canon_element(m.group(0)) is not None]
+               if canon_xml_section(m.group(0), en) is not None
+               or (not en and canon_element(m.group(0)) is not None)]
         if not pts:
             out.append((runs, images, pp))
             continue
@@ -934,6 +1198,21 @@ def _esc(s):
     return (s.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;'))
 
 
+# 제출파일 변환 rejects a sub/superscript that is also bold, italic or
+# underlined: "E-001 문자 스타일 중 BOLD, Italic, UnderLine과 아래첨자를 같이
+# 사용 할 수 없습니다" (an English PCT spec: an italic N with italic subscript CSI-PORT).
+# The script keeps its position; the B/I/U is dropped and reported.
+SCRIPT_FIXED = []         # text of the runs whose B/I/U was dropped
+
+
+def _script_plain(text, mask):
+    if mask & (STYLE_SUB | STYLE_SUPER) and \
+            mask & (STYLE_BOLD | STYLE_ITALIC | STYLE_UNDERLINE):
+        SCRIPT_FIXED.append(text)
+        mask &= ~(STYLE_BOLD | STYLE_ITALIC | STYLE_UNDERLINE)
+    return mask
+
+
 def runs_to_xml(runs):
     """Render a paragraph's runs to PatentCAFDOC inline markup.
     Applies <sub>/<sup>/<u>/<b>/<i> per run style; <br/> handled by caller."""
@@ -941,6 +1220,7 @@ def runs_to_xml(runs):
     for text, mask, sz, color in runs:
         if not text:
             continue
+        mask = _script_plain(text, mask)
         t = _esc(text)
         # wrap innermost->outermost; sub/sup mutually exclusive
         if mask & STYLE_SUB:
@@ -970,7 +1250,7 @@ def _emit_figure_image(data, base):
         with open(base + '.jpg', 'wb') as fh:
             fh.write(data)
         return os.path.basename(base) + '.jpg', 'jpg'
-    im = Image.open(io.BytesIO(data)); im.load()
+    im = open_media(data)
     if im.mode != '1':
         g = im.convert('L')
         hist = g.histogram()
@@ -991,9 +1271,13 @@ def _emit_figure_image(data, base):
     return os.path.basename(base) + '.jpg', 'jpg'
 
 
-def build_patent_xml(src, paras, outdir, imgfiles, xml_name='spec.xml'):
-    """Emit a KIPO PatentCAFDOC xml + pat* images into outdir.
+def build_patent_xml(src, paras, outdir, imgfiles, xml_name='spec.xml',
+                     kind='spec'):
+    """Emit a KIPO PatentCAFDOC xml (kind 'spec') or a WIPO application-body
+    xml (kind 'pct', 국문 PCT) + pat* images into outdir.
     Returns the xml path, or None if the doc isn't patent-sectioned."""
+    pct = kind in ('pct', 'pct_en')
+    en = kind == 'pct_en'
     buckets = {}            # bucket -> list of (runs, images) paragraphs
     title = []
     claims = []             # [{'num', 'paras': [(runs, images)]}]
@@ -1016,14 +1300,34 @@ def build_patent_xml(src, paras, outdir, imgfiles, xml_name='spec.xml'):
         return [(r[0].replace('【', '[').replace('】', ']'),
                  r[1], r[2], r[3]) for r in runs]
 
+    def strip_lead(runs, n):
+        """runs minus their first n characters."""
+        out = []
+        for r in runs:
+            if n >= len(r[0]):
+                n -= len(r[0])
+                continue
+            out.append((r[0][n:],) + tuple(r[1:]))
+            n = 0
+        return out
+
+    container = None        # 'claims' / 'drawings' / 'abstract' while cur == ''
+    dropped = []            # (container, text) body text with no home
+    unknown_heads = []      # (【heading】, section it fell into)
+
     for runs, images, pp in paras:
         text = ''.join(r[0] for r in runs)
-        sec = canon_xml_section(text)
+        sec = canon_xml_section(text, en)
+        if pct and not en:
+            mh = re.match(r'^【\s*(.+?)\s*】\s*$', text.strip())
+            if mh and _norm_tag(mh.group(1)) in PCT_HEAD2XML:
+                sec = (PCT_HEAD2XML[_norm_tag(mh.group(1))], None)
         if sec is not None:
             bucket, num = sec
             seen_heading = True
             cur_claim = None
             cur_fig = None
+            container = None
             if bucket == '_root':
                 cur = 'title'
             elif bucket == 'claim':
@@ -1038,6 +1342,7 @@ def build_patent_xml(src, paras, outdir, imgfiles, xml_name='spec.xml'):
                 cur = 'absfig'
             elif bucket == 'claims' or bucket == 'drawings' or bucket == 'abstract':
                 cur = ''          # container heading: no direct content
+                container = bucket
             else:
                 cur = bucket
             continue
@@ -1045,6 +1350,30 @@ def build_patent_xml(src, paras, outdir, imgfiles, xml_name='spec.xml'):
         if not text.strip() and not images:
             # blank line: keep section spacing but XML ignores empties
             continue
+        mu = re.match(r'^【\s*([^【】]+?)\s*】$', text.strip())
+        if mu and not re.match(r'(수학식|표|화학식|반응식|equation|math|table|'
+                               r'formula|chemistry)\s*[\dA-Za-z]*$',
+                               mu.group(1), re.I):
+            # a 【heading】 the form has no element for: it stays a plain
+            # [heading] line inside the current section - say so
+            unknown_heads.append((mu.group(0), cur or container or '?'))
+        mclaim = (re.match(r'^\s*(\d+)\s*\.\s*(?=\S)', text)
+                  if container == 'claims' or (cur == 'claim' and cur_claim
+                                               and cur_claim.get('auto'))
+                  else None)
+        if mclaim and int(mclaim.group(1)) != (
+                int(cur_claim['num']) + 1 if cur == 'claim' else 1):
+            mclaim = None       # "2." inside a claim body is not claim 2
+        if mclaim:
+            # claim set without 【청구항 N】/【Claim N】 headings: "1. A method
+            # ..." paragraphs under 【CLAIMS】 (a filed English PCT spec) - each number opens
+            # a claim, the number itself becomes the claim's num
+            cur_claim = {'num': mclaim.group(1), 'paras': [], 'auto': True}
+            claims.append(cur_claim)
+            cur = 'claim'
+            container = None
+            runs = strip_lead(runs, mclaim.end())
+            text = text[mclaim.end():]
         if cur == 'figure' and cur_fig is not None:
             cur_fig['imgs'].extend(images)
         elif cur == 'claim' and cur_claim is not None:
@@ -1067,9 +1396,29 @@ def build_patent_xml(src, paras, outdir, imgfiles, xml_name='spec.xml'):
             # stray image outside any content section -> own auto figure
             figures.append({'num': str(len(figures) + 1),
                             'imgs': list(images)})
+        elif text.strip():
+            dropped.append((container or cur or '?', text.strip()))
 
     if not seen_heading:
         return None                     # not a patent-sectioned doc
+    sec_name = {
+        'title': '발명의 명칭', 'techfield': '기술분야',
+        'background': '배경기술', 'disclosure': '발명의 내용',
+        'problem': '해결하려는 과제', 'solution': '과제의 해결 수단',
+        'effects': '발명의 효과', 'drawdesc': '도면의 간단한 설명',
+        'bestmode': '최선의 형태', 'embodiments': '발명의 실시 내용',
+        'industrial': '산업상 이용가능성', 'claims': '청구범위',
+        'claim': '청구항', 'drawings': '도면', 'figure': '도',
+        'abstract': '요약서', 'summary': '요약', 'absfig': '대표도'}
+    for where, t in dropped:
+        # body text right under a container heading (【청구범위】, 【도면】,
+        # 【요약서】) has no XML slot - it used to vanish without a word
+        WARNINGS.append('【%s】 바로 아래 문단은 넣을 자리가 없어 빠짐: "%s"'
+                        % (sec_name.get(where, where), t[:60]))
+    for h, where in unknown_heads:
+        WARNINGS.append('지원하지 않는 제목 %s - 항목으로 만들지 않고 [ ] 본문 '
+                        '줄로 앞 섹션(【%s】)에 넣음'
+                        % (h, sec_name.get(where, where)))
 
     # --- write images + build <figure> list -------------------------------
     os.makedirs(outdir, exist_ok=True)
@@ -1143,7 +1492,13 @@ def build_patent_xml(src, paras, outdir, imgfiles, xml_name='spec.xml'):
     for f in figures:
         if not f['imgs']:
             continue
-        imgs = [img_ref(t, cx, cy) for (t, cx, cy, _p) in f['imgs']]
+        src_imgs = f['imgs']
+        if pct and len(src_imgs) > 1:
+            # ST.36 <figure> is (img): one image per 도
+            WARNINGS.append('도 %s: 이미지 %d개 중 첫 번째만 넣음 (PCT 도면은 '
+                            '도마다 이미지 1개)' % (f['num'], len(src_imgs)))
+            src_imgs = src_imgs[:1]
+        imgs = [img_ref(t, cx, cy) for (t, cx, cy, _p) in src_imgs]
         imgs = [i for i in imgs if i]
         if imgs:
             emitted_fignums.append(f['num'])
@@ -1170,6 +1525,12 @@ def build_patent_xml(src, paras, outdir, imgfiles, xml_name='spec.xml'):
     def sect(tag, bucket):
         body = paras_xml(bucket, counter)
         return '<%s>%s</%s>' % (tag, body, tag) if body else ''
+
+    if pct:
+        return _write_pct_xml(outdir, xml_name, title, buckets, claims,
+                              fig_xml, absfig or absfig_img, sect, paras_xml,
+                              counter, runs_with_imgs,
+                              lang='en' if en else 'ko')
 
     soi = (sect('tech-problem', 'problem') +
            sect('tech-solution', 'solution') +
@@ -1224,6 +1585,257 @@ def build_patent_xml(src, paras, outdir, imgfiles, xml_name='spec.xml'):
     L.append('</PatentCAFDOC>')
     L.append('</KIPO>')
     xml = '\n'.join(L)
+    xp = os.path.join(outdir, xml_name)
+    with open(xp, 'wb') as f:
+        f.write(xml.encode('cp949', 'replace'))
+    return xp
+
+
+def _write_pct_xml(outdir, xml_name, title, buckets, claims, fig_xml,
+                   had_absfig, sect, paras_xml, counter, runs_with_imgs,
+                   lang='ko'):
+    """Assemble the 국문/영문 PCT application-body xml from
+    build_patent_xml's parsed sections (same buckets/claims/figures as the
+    domestic path)."""
+    # text right under 【발명의 내용】 before any sub-heading: <disclosure> is
+    # either sub-elements or plain p's, not both — fold it into the first
+    # sub-section present, else emit it as the disclosure's own p's
+    direct = buckets.pop('disclosure', [])
+    if direct:
+        for b in SOI:
+            if buckets.get(b):
+                buckets[b] = direct + buckets[b]
+                direct = []
+                break
+    if direct:
+        buckets['disclosure'] = direct
+    if had_absfig:
+        WARNINGS.append('【대표도】 무시함 (PCT 서식에는 대표도 항목이 없음)')
+
+    L = ['<?xml version="1.0" encoding="euc-kr" ?>',
+         '<!DOCTYPE application-body SYSTEM "application-body-v1-6.dtd" >',
+         '<application-body lang="%s" dtd-version="1.6" country="KR">' % lang,
+         '<description>',
+         '<invention-title>%s</invention-title>' % _esc(' '.join(title)),
+         sect('technical-field', 'techfield'),
+         sect('background-art', 'background')]
+    soi = (sect('tech-problem', 'problem') +
+           sect('tech-solution', 'solution') +
+           sect('advantageous-effects', 'effects'))
+    if soi:
+        L.append('<disclosure>%s</disclosure>' % soi)
+    elif direct:
+        L.append(sect('disclosure', 'disclosure'))
+    for b in ('drawdesc', 'bestmode', 'embodiments', 'industrial'):
+        L.append(sect(PCT_TAG[b], b))
+    L.append('</description>')
+    # the PCT import drops <br/> inside claim-text (claim lines run together:
+    # "메모리; 및프로세싱 ..."); one sibling <claim-text> per line keeps them
+    L.append('<claims>')
+    for c in claims:
+        lines = [runs_with_imgs(r, i) for r, i in c['paras']]
+        body = ''.join('<claim-text>%s</claim-text>' % s
+                       for s in lines if s.strip())
+        L.append('<claim num="%s">%s</claim>' %
+                 (_esc(c['num']), body or '<claim-text></claim-text>'))
+    L.append('</claims>')
+    abst = paras_xml('summary', counter)
+    if abst:
+        L.append('<abstract>%s</abstract>' % abst)
+    if fig_xml:
+        L.append('<drawings>')
+        L.extend(fig_xml)
+        L.append('</drawings>')
+    L.append('</application-body>')
+    xp = os.path.join(outdir, xml_name)
+    with open(xp, 'wb') as f:
+        f.write('\n'.join(L).encode('cp949', 'replace'))
+    return xp
+
+
+# --- OpinionDOC (의견서) XML emission ---------------------------------------
+# Vocabulary from an NKEditor-exported 의견서 and DOCCommon.xsd:
+#   <KIPO><OpinionDOC><Opinion> (P | BR)* </Opinion></OpinionDOC></KIPO>
+#   <P indent="14|0" align="JUSTIFIED|LEFT|CENTER|RIGHT"> text, <B> <I> <U>
+#     <SB>sub <SP>sup, <BR/>, <EMI id height width file/> (mm, opnNNNNN.jpg)
+#   tables: <P indent="0" align="LEFT"><table><tgroup xmlns=OASIS cols>
+#     <colspec colnum colname colwidth/> (1/1800 inch) <tbody><row>
+#     <entry align colname | namest nameend | morerows> ... </entry>
+# The Opinion element itself is the 【의견내용】 item, so a docx 【의견내용】
+# line is dropped. Indent follows docx2hml's rule (verified against the
+# firm's filed 의견서): 【...】 lines, bare [청구항 N] and 인용발명N captions
+# 0, all other paragraphs 14.
+OPN_TABLE_WIDTH = 11686       # full text width in colwidth units (165mm)
+OASIS_NS = 'http://www.oasis-open.org/tables/exchange/1.0'
+
+
+def runs_to_opn(runs):
+    out = []
+    for text, mask, sz, color in runs:
+        if not text:
+            continue
+        mask = _script_plain(text, mask)
+        t = _esc(text)
+        if mask & STYLE_SUB:
+            t = '<SB>' + t + '</SB>'
+        elif mask & STYLE_SUPER:
+            t = '<SP>' + t + '</SP>'
+        if mask & STYLE_UNDERLINE:
+            t = '<U>' + t + '</U>'
+        if mask & STYLE_BOLD:
+            t = '<B>' + t + '</B>'
+        if mask & STYLE_ITALIC:
+            t = '<I>' + t + '</I>'
+        out.append(t)
+    return ''.join(out)
+
+
+def build_opinion_xml(src, blocks, outdir, imgfiles, xml_name='opinion.xml'):
+    """Emit a KIPO OpinionDOC xml + opn* JPEG images into outdir.
+    blocks: parse_docx(..., blocks=True) output. Returns the xml path."""
+    os.makedirs(outdir, exist_ok=True)
+    media = {}
+    with zipfile.ZipFile(src) as zf:
+        for name in zf.namelist():
+            if name.startswith('word/media/'):
+                media[name] = zf.read(name)
+    seq = [0]
+
+    def emi(tgt, cx, cy):
+        data = media.get(tgt)
+        if data is None:                 # rendered equation ('@eqN')
+            try:
+                with open(imgfiles[tgt], 'rb') as fh:
+                    data = fh.read()
+            except Exception:
+                return ''
+        seq[0] += 1
+        fname = 'opn%05d.jpg' % seq[0]
+        path = os.path.join(outdir, fname)
+        if data[:3] == b'\xff\xd8\xff':
+            with open(path, 'wb') as fh:
+                fh.write(data)
+        else:
+            im = open_media(data)
+            if im.mode in ('RGBA', 'LA', 'P'):
+                bg = Image.new('RGB', im.size, 'white')
+                im = im.convert('RGBA')
+                bg.paste(im, mask=im.split()[-1])
+                im = bg
+            elif im.mode != 'RGB':
+                im = im.convert('RGB')
+            im.save(path, 'JPEG', quality=92)
+        wi = max(1, int(round((cx or 0) / 36000.0)))
+        he = max(1, int(round((cy or 0) / 36000.0)))
+        if wi > 165 or he > 222:         # KIPO page box, keep aspect
+            s = min(165.0 / wi, 222.0 / he)
+            wi, he = max(1, int(wi * s)), max(1, int(he * s))
+        return '<EMI id="%d" height="%d" width="%d" file="%s"/>' % (
+            seq[0], he, wi, fname)
+
+    def inline(runs, images):
+        if not images:
+            return runs_to_opn(runs)
+        out, off = [], 0
+        pending = sorted(images, key=lambda i: i[3])
+        for r in runs:
+            while pending and pending[0][3] <= off:
+                t, cx, cy, _ = pending.pop(0)
+                out.append(emi(t, cx, cy))
+            out.append(runs_to_opn([r]))
+            off += len(r[0])
+        out.extend(emi(t, cx, cy) for t, cx, cy, _ in pending)
+        return ''.join(out)
+
+    def align(pp, default):
+        jc = (pp or {}).get('jc')
+        return {PALIGN_CENTER: 'CENTER', PALIGN_RIGHT: 'RIGHT'}.get(jc, default)
+
+    def table(t):
+        rows = t['rows']
+        ncol = max([len(t['grid'])] +
+                   [sum(c['span'] for c in r) for r in rows] or [1])
+        grid = (t['grid'] + [0] * ncol)[:ncol]
+        if not any(grid):
+            grid = [1] * ncol
+        grid = [g or max(1, sum(grid) // ncol) for g in grid]
+        # dxa (1/1440 in) -> 1/1800 in; shrink a table wider than the page
+        widths = [g * 1800 // 1440 for g in grid]
+        if sum(widths) > OPN_TABLE_WIDTH:
+            widths = [w * OPN_TABLE_WIDTH // sum(widths) for w in widths]
+        # vertical merges: a 'restart' cell spans every 'continue' cell
+        # below it in the same grid column
+        pos = []                          # per row: [(col, cell)]
+        for r in rows:
+            col, lst = 1, []
+            for c in r:
+                lst.append((col, c))
+                col += c['span']
+            pos.append(lst)
+        L = ['<P indent="0" align="LEFT">',
+             "<table><tgroup xmlns='%s' cols=\"%d\">" % (OASIS_NS, ncol)]
+        for i, w in enumerate(widths):
+            L.append('<colspec colnum="%d" colname="col%d" colwidth="%d"/>'
+                     % (i + 1, i + 1, max(1, w)))
+        L.append('<tbody>')
+        for ri, lst in enumerate(pos):
+            L.append('<row>')
+            for col, c in lst:
+                if c['vmerge'] == 'continue':
+                    continue
+                more = 0
+                if c['vmerge'] == 'restart':
+                    for below in pos[ri + 1:]:
+                        if any(bc == col and b['vmerge'] == 'continue'
+                               for bc, b in below):
+                            more += 1
+                        else:
+                            break
+                parts = [inline(runs, imgs) for runs, imgs, _pp in c['paras']]
+                while parts and not parts[-1].strip():
+                    parts.pop()
+                first_pp = c['paras'][0][2] if c['paras'] else None
+                a = {'CENTER': 'center', 'RIGHT': 'right'}.get(
+                    align(first_pp, ''), 'justify')
+                attrs = 'align="%s"' % a
+                if c['span'] > 1:
+                    attrs += ' namest="col%d" nameend="col%d"' % (
+                        col, col + c['span'] - 1)
+                else:
+                    attrs += ' colname="col%d"' % col
+                if more:
+                    attrs += ' morerows="%d"' % more
+                L.append('<entry %s>%s</entry>' % (attrs, '<BR/>'.join(parts)))
+            L.append('</row>')
+        L.append('</tbody></tgroup></table></P>')
+        return '\n'.join(L)
+
+    body = []
+    for kind, item in blocks:
+        if kind == 'tbl':
+            if item['rows']:
+                body.append(table(item))
+            continue
+        runs, images, pp = item
+        text = ''.join(r[0] for r in runs).strip()
+        if text == '【의견내용】' and not images:
+            continue
+        if not text and not images:
+            body.append('<BR/>')
+            continue
+        flush = (text.startswith('【') or
+                 re.match(r'^\[청구항\s*\d+\]$', text) or
+                 re.match(r'^인용발명\d', text))
+        body.append('<P indent="%d" align="%s">%s</P>' % (
+            0 if flush else 14, align(pp, 'JUSTIFIED'), inline(runs, images)))
+    # leading blank lines would sit right under the 【의견내용】 marker
+    while body and body[0] == '<BR/>':
+        body.pop(0)
+    xml = '\n'.join(['<?xml version="1.0" encoding="euc-kr" ?>',
+                     '<KIPO keapsVersion="4.02" editorKind="K" pageCount="1" '
+                     'xmlns="http://www.kipo.go.kr">',
+                     '<OpinionDOC>', '<Opinion>'] + body +
+                    ['</Opinion>', '</OpinionDOC>', '</KIPO>'])
     xp = os.path.join(outdir, xml_name)
     with open(xp, 'wb') as f:
         f.write(xml.encode('cp949', 'replace'))
@@ -1400,6 +2012,23 @@ def build_job(paras, imgdir, imgfiles, skel=None):
     return b''.join(out)
 
 
+def open_media(data):
+    """Pillow image of docx media bytes. WMF/EMF (OLE previews such as
+    MathType equations) load at 72 dpi by default - a 26x18 px blot once
+    thresholded - so they are rasterized at 600 dpi on white."""
+    im = Image.open(io.BytesIO(data))
+    if im.format in ('WMF', 'EMF') or data[:4] == b'\xd7\xcd\xc6\x9a' \
+            or data[40:44] == b' EMF':
+        im.load(dpi=600)
+        if im.mode in ('RGBA', 'LA', 'P'):
+            bg = Image.new('RGB', im.size, 'white')
+            bg.paste(im.convert('RGBA'), mask=im.convert('RGBA').split()[3])
+            im = bg
+    else:
+        im.load()
+    return im
+
+
 def media_to_tiff(data, out_tif):
     """Convert image bytes to an uncompressed TIFF at out_tif via Pillow.
 
@@ -1407,8 +2036,7 @@ def media_to_tiff(data, out_tif):
     which fails on palette/odd PNGs. Staging a TIFF makes the embed reliable.
     Returns True on success."""
     try:
-        im = Image.open(io.BytesIO(data))
-        im.load()
+        im = open_media(data)
     except Exception:
         return False
     # normalize modes ImageGear's TIFF reader handles cleanly
@@ -1453,7 +2081,90 @@ def _decode_output(b):
     return b.decode('utf-8', errors='replace')
 
 
-def render_objects(src, imgdir):
+def _clock(sec):
+    return '%d분 %02d초' % divmod(int(sec), 60)
+
+
+class Stage:
+    """`with Stage('NKEditor에서 .hlt 저장'):` - prints the step and keeps
+    its elapsed time ticking on one line until the block ends, so a long
+    NKEditor/Word step does not look like a hang."""
+
+    def __init__(self, label):
+        self.label = label
+
+    def __enter__(self):
+        import threading
+        self.t0 = time.time()
+        self.stop = threading.Event()
+
+        def tick():
+            while not self.stop.wait(2):
+                sys.stdout.write('\r  %s 중... (%s 경과)   '
+                                 % (self.label, _clock(time.time() - self.t0)))
+                sys.stdout.flush()
+        sys.stdout.write('  %s 중...' % self.label)
+        sys.stdout.flush()
+        self.th = threading.Thread(target=tick, daemon=True)
+        self.th.start()
+        return self
+
+    def __exit__(self, *exc):
+        self.stop.set()
+        self.th.join()
+        sys.stdout.write('\r  %s %s (%s)%s\n'
+                         % (self.label, '실패' if exc[0] else '끝',
+                            _clock(time.time() - self.t0), ' ' * 20))
+        sys.stdout.flush()
+        return False
+
+
+def run_with_progress(cmd, limit, imgdir, n_math, n_tbl):
+    """subprocess.run(cmd, capture_output, text, timeout=limit), but showing
+    one live status line meanwhile: EqRender prints nothing until it ends,
+    and a long spec (788 equations) looked hung for minutes. The
+    counts are the eqNNNN/tblNNNN files written so far."""
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True,
+                            errors='replace')
+    t0 = time.time()
+    shown = False
+    while True:
+        try:
+            out, err = proc.communicate(timeout=2)
+            break
+        except subprocess.TimeoutExpired:
+            if time.time() - t0 > limit:
+                proc.kill()
+                proc.communicate()
+                if shown:
+                    print(flush=True)
+                raise
+            try:
+                names = os.listdir(imgdir)
+            except OSError:
+                names = []
+            ne = sum(1 for n in names if n.startswith('eq')
+                     and n.endswith('.tif'))
+            nt = sum(1 for n in names if n.startswith('tbl')
+                     and n.endswith('.tif'))
+            parts = []
+            if n_math:
+                parts.append('수식 %d/%d' % (min(ne, n_math), n_math))
+            if n_tbl:
+                parts.append('표 %d/%d' % (min(nt, n_tbl), n_tbl))
+            sys.stdout.write('\r  그림 변환 중: %s  (%s 경과)   '
+                             % (', '.join(parts), _clock(time.time() - t0)))
+            sys.stdout.flush()
+            shown = True
+    if shown:
+        sys.stdout.write('\r  그림 변환 끝: %s 걸림%s\n'
+                         % (_clock(time.time() - t0), ' ' * 30))
+        sys.stdout.flush()
+    return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+
+
+def render_objects(src, imgdir, tables=True):
     """Render the docx's OMML equations AND top-level tables to trimmed
     300dpi G4 TIFFs via EqRender.exe + Word COM (Range.CopyAsPicture ->
     EMF -> rasterize -> crop).
@@ -1472,13 +2183,16 @@ def render_objects(src, imgdir):
     Rendering can fail transiently — Word COM refuses automation while the
     user's own WINWORD shows a modal dialog, or a stale instance is still
     shutting down — so retry a few times before degrading to linear text
-    (equations) / flattened cells (tables)."""
+    (equations) / flattened cells (tables).
+
+    tables=False: the caller emits tables natively (의견서) - only equations
+    are wanted, and a doc without equations skips Word entirely."""
     empty = ({}, {})
     try:
         with zipfile.ZipFile(src) as zf:
             xml = zf.read('word/document.xml')
         n_math = len(main_story_omaths(ET.fromstring(xml)))
-        n_tbl = xml.count(b'<w:tbl>') + xml.count(b'<w:tbl ')
+        n_tbl = (xml.count(b'<w:tbl>') + xml.count(b'<w:tbl ')) if tables else 0
         if n_math == 0 and n_tbl == 0:
             return empty
         if not os.path.exists(EQRENDER):
@@ -1503,11 +2217,19 @@ def render_objects(src, imgdir):
 
         last_err = ''
         eqs, tbls, e_expect, t_expect = {}, {}, None, None
+        # Word renders ~1 object per 5-10 s on a long spec (e.g. 148
+        # equations + 25 tables); a flat 600 s cut it off mid-way, and every
+        # retry left another hidden WINWORD behind
+        limit = max(600, 15 * (n_math + n_tbl) + 120)
+        what = ', '.join(s for s in (
+            '수식 %d개' % n_math if n_math else '',
+            '표 %d개' % n_tbl if n_tbl else '') if s)
+        print('Word로 %s를 그림으로 변환합니다 (개수가 많으면 몇 분 걸림)' % what,
+              flush=True)
         for attempt in range(4):
             try:
-                r = subprocess.run([EQRENDER, src, imgdir],
-                                   capture_output=True, text=True,
-                                   timeout=600)
+                r = run_with_progress([EQRENDER, src, imgdir], limit,
+                                      imgdir, n_math, n_tbl)
                 last_err = (r.stderr or r.stdout or '').strip()[-300:]
                 eqs = read_map('eqmap.tsv', 'eq')
                 tbls = read_map('tblmap.tsv', 'tbl')
@@ -1523,6 +2245,8 @@ def render_objects(src, imgdir):
                               r'rendered=(\d+)', r.stdout or '')
                 if m:
                     t_expect = int(m.group(1)) - int(m.group(2))
+                if not tables:
+                    tbls, t_expect = {}, None
                 if e_total is not None and e_total != n_math:
                     # deterministic mismatch — retrying won't help
                     WARNINGS.append(
@@ -1540,7 +2264,12 @@ def render_objects(src, imgdir):
                 last_err = ('partial eq %d/%s tbl %d/%s'
                             % (len(eqs), e_expect, len(tbls), t_expect))
             except subprocess.TimeoutExpired:
-                last_err = 'timeout'
+                # slowness is not transient: another run would only time out
+                # again (and orphan another Word)
+                last_err = 'timeout %ds' % limit
+                print('WARNING: object render incomplete (%s)' % last_err,
+                      file=sys.stderr)
+                break
             # transient Word COM contention — let a busy/modal WINWORD settle
             time.sleep(3 + attempt * 3)
         else:
@@ -1566,17 +2295,20 @@ def render_objects(src, imgdir):
         return empty
 
 
-def parse_docx(path, imgdir, eqs=None, tbls=None):
+def parse_docx(path, imgdir, eqs=None, tbls=None, blocks=False):
     """Parse docx; extract media to imgdir (as TIFF). Returns (paras, {mediaTarget: path}).
     eqs: {omath_ordinal: (tif, w_mm, h_mm)} from render_objects — spliced
     into paragraphs where each m:oMath appears.
     tbls: {ordinal: (tif, w_mm, h_mm)} rendered top-level tables — each
-    becomes an image-only paragraph at the w:tbl's document position."""
+    becomes an image-only paragraph at the w:tbl's document position.
+    blocks: return iter_blocks() output (tables kept as tables) instead."""
     imgfiles = {}
     tstate = [0]                          # top-level w:tbl ordinal counter
     with zipfile.ZipFile(path) as zf:
         styles = load_styles(zf)
         rels = load_rels(zf)
+        NUMBERING.clear()
+        NUMBERING.update(load_numbering(zf, styles))
         os.makedirs(imgdir, exist_ok=True)
         for name in zf.namelist():
             if name.startswith('word/media/'):
@@ -1599,6 +2331,8 @@ def parse_docx(path, imgdir, eqs=None, tbls=None):
         eq_ord = {id(om): i + 1
                   for i, om in enumerate(main_story_omaths(body))}
         eqstate = (eq_ord, eqs)
+    if blocks:
+        return list(iter_blocks(body, styles, rels, imgfiles, eqstate)), imgfiles
     paras = list(iter_paragraphs(body, styles, rels, imgfiles, eqstate,
                                  tbls=tbls, tstate=tstate))
     return paras, imgfiles
@@ -1615,27 +2349,183 @@ def _is_patent_doc(paras):
                for runs, _i, _pp in paras)
 
 
-def convert_structured(src, dst, paras, imgfiles):
-    """docx -> KIPO PatentCAFDOC xml -> NKEditor builds the structured doc ->
-    drives Save-As to a real .hlt at `dst`. Returns True on success."""
+# --- document kind ---------------------------------------------------------
+# NKEditor builds a different KIPO document from each XML root (verified by
+# importing and saving one of each):
+#   <KIPO><PatentCAFDOC>        -> 국내 특허 명세서
+#   <application-body lang=ko>  -> 국문 PCT 국제출원 명세서 (【청구의 범위】,
+#                                  【기술적 해결방법】 - the element set of the
+#                                  filed WO0 .hlt files; header kind 03)
+#   <KIPO><OpinionDOC>          -> 의견서 (【의견내용】, header kind 07)
+# PCTPatentCAFDOC / PCTPatentDOC do NOT give the PCT form (the first builds a
+# domestic spec, the second is pasted in as raw text). 보정서 .hlt files are
+# made from the .fin, not from a docx, so an amendment docx is only detected
+# (so its 【청구항 N】 lines can't pass it off as a spec) and goes flat.
+KIND_LABEL = {'spec': '국내 특허 명세서', 'pct': '국문 PCT 명세서',
+              'pct_en': '영문 PCT 명세서',
+              'opinion': '의견서', 'amend': '보정서', 'flat': '일반 문서'}
+# headings only the PCT international-application form uses
+PCT_ONLY_HEADS = ('청구의범위', '기술적해결방법', '발명의실시를위한형태',
+                  '발명의실시를위한최선의형태', '산업상이용가능성')
+AMEND_HEADS = ('보정대상항목', '보정방법', '보정내용')
+# country token of a PCT international application (SP00001-WO0, ...-WO_SP..).
+# The bare word PCT is not one: national-stage refs carry it too.
+WO_TOKEN = re.compile(r'(?<![A-Za-z])WO\d*(?![A-Za-z])')
+# domestic case folder (P0000001-KR0); folder names only — a PCT draft's own
+# filename may say "...-KR0 (SP00003-PCT)"
+KR_DIR_TOKEN = re.compile(r'(?<![A-Za-z])KR\d(?![0-9])')
+# foreign-case folders (SP00004-IN0, ..._CN0_...): their "의견서" docx files
+# are letters/reports for the foreign associate, not KIPO 의견서
+FOREIGN_TOKEN = re.compile(r'(?<![A-Za-z])(?:US|CN|JP|EP|IN|TW|DE|GB|FR|VN|BR|'
+                           r'CA|AU|MX|RU|ID|SG|PH|TH|MY)\d(?![0-9])')
+
+
+def docx_lines(src):
+    """Plain text of every w:p (body, cells, text boxes) — cheap, for kind
+    detection before the full parse. Tracked deletions are w:delText, so
+    they don't show up."""
+    with zipfile.ZipFile(src) as zf:
+        root = ET.fromstring(zf.read('word/document.xml'))
+    return [''.join(t.text or '' for t in p.iter(W + 't'))
+            for p in root.iter(W + 'p')]
+
+
+def detect_kind(src, lines):
+    """-> (kind, reason). kind in KIND_LABEL."""
+    opinion = amend = None
+    heads, pct_heads, en_heads = set(), [], []
+    for line in lines:
+        s = line.strip()
+        for m in re.finditer(r'【\s*([^【】]+?)\s*】', s):
+            inner = _norm_tag(m.group(1))
+            en_sec = canon_xml_section(m.group(0), en=True)
+            if en_sec and en_sec[0] not in ('claim', 'figure') \
+                    and m.group(0) not in en_heads:
+                en_heads.append(m.group(0))
+            if inner == '의견내용':
+                opinion = opinion or m.group(0)
+            elif inner in AMEND_HEADS and s.startswith(m.group(0)):
+                amend = amend or m.group(0)
+            if inner in PCT_ONLY_HEADS:
+                heads.add(inner)
+                if m.group(0) not in pct_heads:
+                    pct_heads.append(m.group(0))
+            elif canon_xml_section(m.group(0)) is not None:
+                heads.add(inner)
+    if opinion:
+        return 'opinion', opinion
+    if amend:
+        return 'amend', amend
+    # a KR 의견서 may quote 【청구항 N】 lines, and a 보정서 is often a bare
+    # claim set — either would pass for a spec by its headings
+    base = os.path.basename(src)
+    if not FOREIGN_TOKEN.search(os.path.abspath(src)):
+        if '의견서' in base:
+            return 'opinion', '파일명의 "의견서"'
+        if '보정서' in base:
+            return 'amend', '파일명의 "보정서"'
+    # English ST.36 headings (【Technical Field】, 【CLAIMS】, ...): only the
+    # English PCT form uses them, whatever the case folder says
+    if len(en_heads) >= 3 and len(en_heads) > len(heads):
+        return 'pct_en', ', '.join(en_heads[:3])
+    if heads:
+        # case-folder country token first: a KR0 working draft can carry PCT
+        # headings (a KR0 "Processing" docx) yet was filed as a domestic spec
+        tok = WO_TOKEN.search(os.path.abspath(src))
+        if tok:
+            return 'pct', '경로의 국가 토큰 %s' % tok.group(0)
+        kr = KR_DIR_TOKEN.search(os.path.dirname(os.path.abspath(src)))
+        if kr:
+            return 'spec', '사건 폴더의 국가 토큰 %s' % kr.group(0)
+        if pct_heads:
+            return 'pct', ', '.join(pct_heads[:3])
+        return 'spec', '특허 섹션 제목'
+    return 'flat', '특허 섹션 제목 없음'
+
+
+def convert_structured(src, dst, paras, imgfiles, kind='spec'):
+    """docx -> KIPO xml for `kind` (spec: PatentCAFDOC, pct: application-body,
+    opinion: OpinionDOC; `paras` is parse_docx(blocks=True) output for
+    opinion) -> NKEditor builds the structured doc -> drives Save-As to a
+    real .hlt at `dst`. Returns True on success."""
     import nkwin
-    stem = os.path.splitext(os.path.basename(dst))[0]
+    # NKEditor 6.x crashes (heap corruption 0xc0000374) on Save-As when the
+    # opened xml has a long Korean name (a WO0 draft); the save-as
+    # filename follows the xml stem, so keep both short and move the .hlt to
+    # `dst` afterwards
+    stem = 'd2h' + os.urandom(3).hex()
     scratch = tempfile.mkdtemp(prefix='d2h_xml')
-    xmlpath = build_patent_xml(src, paras, scratch, imgfiles,
-                               xml_name=stem + '.xml')
+    del SCRIPT_FIXED[:]
+    if kind == 'opinion':
+        xmlpath = build_opinion_xml(src, paras, scratch, imgfiles,
+                                    xml_name=stem + '.xml')
+    else:
+        xmlpath = build_patent_xml(src, paras, scratch, imgfiles,
+                                   xml_name=stem + '.xml', kind=kind)
     if not xmlpath:
         return False
-    print('structured: emitted PatentCAFDOC ->', xmlpath)
-    saved = nkwin.nk_import_and_save_hlt(
-        xmlpath, stem, out_dir=os.path.dirname(os.path.abspath(dst)))
+    if SCRIPT_FIXED:
+        seen = []
+        for s in SCRIPT_FIXED:
+            if s not in seen:
+                seen.append(s)
+        WARNINGS.append('첨자 %d곳의 굵게/기울임/밑줄을 뺐음 (제출파일 변환 '
+                        'E-001: 첨자와 같이 못 씀): %s'
+                        % (len(SCRIPT_FIXED), ', '.join(seen[:8])))
+    print('structured: emitted %s ->' % {
+        'spec': 'PatentCAFDOC', 'pct': 'application-body',
+        'pct_en': 'application-body (en)',
+        'opinion': 'OpinionDOC'}[kind], xmlpath)
+    with Stage('NKEditor에서 .hlt 저장'):
+        saved = nkwin.nk_import_and_save_hlt(
+            xmlpath, stem, out_dir=os.path.dirname(os.path.abspath(dst)))
     if not saved or not os.path.exists(saved):
         print('ERROR: NKEditor save-as did not produce a .hlt', file=sys.stderr)
         return False
     if os.path.abspath(saved) != os.path.abspath(dst):
         import shutil
         shutil.move(saved, dst)   # move — don't litter the dialog's folder
+    if kind in PCT_KIND_TARGET:
+        set_pct_intl_kind(dst, kind)
     print('structured hlt ->', dst)
     return True
+
+
+# .hlt header byte 0x20 is the document kind. NKEditor builds an imported
+# application-body as kind 03 (PctPat.frm, PCT번역문 제출서 = 국내진입), whose
+# 제출파일 변환 fails with E-259 "특허법 시행규칙에 따라 작성되지 않았습니다".
+# A PCT명세서(국제출원) 한글서식 document (PctPatHD.frm, saved from a new doc)
+# is kind 0x48 with an otherwise identical header; the same import with only
+# this byte set to 0x48 passes 제출파일 변환 (verified on a Korean PCT draft, 2026-10-28).
+HLT_KIND_OFFSET = 0x20
+HLT_KIND_PCT_NATIONAL = 0x03
+HLT_KIND_PCT_INTL_KO = 0x48
+# PCT명세서(국제출원) 영문서식: filed English PCT .hlt files are 0x49
+HLT_KIND_PCT_INTL_EN = 0x49
+PCT_KIND_TARGET = {
+    'pct': (HLT_KIND_PCT_INTL_KO, 'PCT명세서(국제출원) 한글서식'),
+    'pct_en': (HLT_KIND_PCT_INTL_EN, 'PCT명세서(국제출원) 영문서식'),
+}
+
+
+def set_pct_intl_kind(path, kind='pct'):
+    target, label = PCT_KIND_TARGET[kind]
+    with open(path, 'r+b') as f:
+        head = f.read(HLT_KIND_OFFSET + 1)
+        if not head.startswith(b'HAN Lite Document'):
+            WARNINGS.append('PCT 문서 종류 설정 실패 - .hlt 머리가 아님')
+            return
+        k = head[HLT_KIND_OFFSET]
+        if k == target:
+            return
+        if k != HLT_KIND_PCT_NATIONAL:
+            # unknown kind: leave it, but say so - 제출파일 변환 may reject it
+            WARNINGS.append('PCT 문서 종류값이 예상(03)과 다름(%02x) - %s(%02x)'
+                            '으로 바꾸지 않음' % (k, label, target))
+            return
+        f.seek(HLT_KIND_OFFSET)
+        f.write(bytes([target]))
+    print('pct: document type 03 -> %02x (%s)' % (target, label))
 
 
 def fix_rtf(path):
@@ -1697,7 +2587,8 @@ def make_review(src, dst):
         rtf = None
         for attempt in (1, 2):
             try:
-                rtf = nkwin.nk_export_rtf(probe)
+                with Stage('NKEditor에서 검토용 .rtf 내보내기'):
+                    rtf = nkwin.nk_export_rtf(probe)
                 why = nkwin.LAST_EXPORT_ERROR
                 crashed = nkwin.LAST_EXPORT_CRASHED
             except Exception as e:
@@ -1725,9 +2616,15 @@ def make_review(src, dst):
         return
     try:
         for cand in (cmpdoc, base + '.compare-new.docx'):
-            r = subprocess.run([DOCCMP, src, rtfdst, cand],
-                               capture_output=True, timeout=300)
+            with Stage('Word로 원본 docx와 비교 문서 만들기'):
+                r = subprocess.run([DOCCMP, src, rtfdst, cand],
+                                   capture_output=True, timeout=300)
             if r.returncode == 0 and os.path.exists(cand):
+                for ln in _decode_output(r.stdout).splitlines():
+                    if ln.startswith('WARN '):
+                        issue('비교 문서 - ' + ln[5:])
+                    elif ln.startswith('tables shown'):
+                        print('review: ' + ln)
                 print('review: compare doc ->', cand)
                 return
         issue('비교 문서 생성 실패 - %s'
@@ -1737,17 +2634,43 @@ def make_review(src, dst):
         issue('비교 문서 생성 실패 - %r' % e)
 
 
-def convert_one(src, dst, force_flat=False):
-    """Convert a single .docx to .hlt. Returns 0 on success."""
+def convert_one(src, dst, kind=None):
+    """Convert a single .docx to .hlt. Returns 0 on success.
+    kind: forced document kind (KIND_LABEL key), None = detect."""
     imgdir = tempfile.mkdtemp(prefix='d2h_img')
     CHAR_REPORT.clear()
     del WARNINGS[:]
     del REVIEW_ISSUES[:]
-    eqs, tbls = render_objects(src, imgdir)
-    paras, imgfiles = parse_docx(src, imgdir, eqs, tbls)
-    paras = split_glued_headings(paras)
+    if kind:
+        why = '--kind 지정'
+    else:
+        kind, why = detect_kind(src, docx_lines(src))
+    print('document type: %s (판별 근거: %s)' % (KIND_LABEL[kind], why))
+    if kind == 'amend':
+        # 보정서 .hlt is made from the .fin; keep its 【청구항 N】 lines from
+        # turning it into a spec and convert it as a plain document
+        print('  보정서는 .fin에서 만드는 문서라 구조 변환 대상이 아닙니다 - '
+              '일반 문서로 변환합니다.')
+        kind = 'flat'
+    eqs, tbls = render_objects(src, imgdir, tables=(kind != 'opinion'))
+    if kind == 'opinion':
+        blocks, imgfiles = parse_docx(src, imgdir, eqs, blocks=True)
+        paras = None            # flat fallback re-parses on demand
+    else:
+        paras, imgfiles = parse_docx(src, imgdir, eqs, tbls)
+        paras = split_glued_headings(paras, en=(kind == 'pct_en'))
 
-    if CHAR_REPORT or WARNINGS:
+    def write_report():
+        if not (CHAR_REPORT or WARNINGS):
+            # clean state: remove reports from a previous run so stale
+            # warnings can't be mistaken for problems in THIS output
+            for stale in (os.path.splitext(dst)[0] + '.charset.txt',
+                          os.path.splitext(dst)[0] + '.charset.docx'):
+                try:
+                    os.remove(stale)
+                except OSError:
+                    pass
+            return
         # human-review trail: conversion warnings + every unsupported char
         # and what it became — as a Word table (easy to scan) plus a plain
         # text mirror for scripts.
@@ -1772,27 +2695,43 @@ def convert_one(src, dst, force_flat=False):
         drops = len(CHAR_REPORT) - subs
         print('review: %d warnings, %d substituted, %d dropped — %s(.docx)'
               % (len(WARNINGS), subs, drops, rep), file=sys.stderr)
-    else:
-        # clean state: remove reports from a previous run so stale warnings
-        # can't be mistaken for problems in THIS output
-        for stale in (os.path.splitext(dst)[0] + '.charset.txt',
-                      os.path.splitext(dst)[0] + '.charset.docx'):
-            try:
-                os.remove(stale)
-            except OSError:
-                pass
 
-    # Patent-sectioned docs go through the real structured path: emit KIPO
-    # PatentCAFDOC XML, let NKEditor build the element tree, then save .hlt.
-    # Plain docs fall back to the flat TerConv pipeline.
-    if not force_flat and _is_patent_doc(paras) and HAVE_PIL:
+    write_report()
+    n_warn = len(WARNINGS)
+
+    # Patent / PCT / 의견서 docs go through the real structured path: emit the
+    # KIPO xml for that kind, let NKEditor build the element tree, then save
+    # .hlt. Plain docs (and a failed structured build) use the flat TerConv
+    # pipeline.
+    if kind != 'flat' and HAVE_PIL:
         try:
-            if convert_structured(src, dst, paras, imgfiles):
-                make_review(src, dst)
-                return 0
+            if convert_structured(src, dst,
+                                  blocks if kind == 'opinion' else paras,
+                                  imgfiles, kind):
+                if len(WARNINGS) > n_warn:
+                    # the XML build / PCT kind step can add warnings
+                    for w in WARNINGS[n_warn:]:
+                        print('WARNING: %s' % w, file=sys.stderr)
+                    write_report()
+                done = True
+            else:
+                done = False
         except Exception as e:
             print('structured path failed (%r); falling back to flat' % e,
                   file=sys.stderr)
+            done = False
+        if done:
+            # outside the try: a review-file failure (an rtf still locked by
+            # the editor) used to send a finished structured .hlt down the
+            # flat path, which overwrote it
+            try:
+                make_review(src, dst)
+            except Exception as e:
+                print('review: 검토 파일 생성 실패 (%r)' % e, file=sys.stderr)
+                REVIEW_ISSUES.append('검토 파일 생성 실패 - %r' % e)
+            return 0
+    if paras is None:
+        paras, imgfiles = parse_docx(src, imgdir, eqs)
 
     job = build_job(paras, imgdir, imgfiles, None)
     nimg = sum(1 for r, i, pp in paras for _ in i)
@@ -1810,9 +2749,10 @@ def convert_one(src, dst, force_flat=False):
     env['TMP'] = env['TEMP'] = imgdir
     try:
         r = subprocess.run([TERCONV, jobfile, dst, NK_DIR],
-                           capture_output=True, text=True, timeout=240, env=env)
-        sys.stdout.write(r.stdout)
-        sys.stderr.write(r.stderr)
+                           capture_output=True, text=True, errors='replace',
+                           timeout=240, env=env)
+        sys.stdout.write(r.stdout or '')
+        sys.stderr.write(r.stderr or '')
         if r.returncode != 0:
             return r.returncode
     finally:
@@ -1835,13 +2775,21 @@ def main():
         except Exception:
             pass
     args = [a for a in sys.argv[1:] if not a.startswith('--')]
-    force_flat = '--flat' in sys.argv[1:]
+    kind = 'flat' if '--flat' in sys.argv[1:] else None
+    for a in sys.argv[1:]:
+        if a.startswith('--kind='):
+            kind = a.split('=', 1)[1]
+            if kind not in KIND_LABEL:
+                print('--kind must be one of: %s' % ', '.join(KIND_LABEL))
+                return 2
     # the Explorer right-click wrapper passes this: its console closes on its
     # own after a successful conversion, which hid every review failure
     pause_on_review = '--pause-on-review-error' in sys.argv[1:]
     if not args:
         print('usage: docx2hlt.py input.docx [output.hlt] [more.docx ...]')
         print('  output omitted -> <input>.hlt written next to each input')
+        print('  --kind=spec|pct|pct_en|opinion|flat  override the detected kind '
+              '(--flat = --kind=flat)')
         return 2
     # explicit output only in the classic 2-arg form; otherwise every arg is
     # a .docx and each writes <same name>.hlt in its own folder. Conversions
@@ -1858,7 +2806,7 @@ def main():
         if len(jobs) > 1:
             print('=== %s' % src)
         try:
-            r = convert_one(src, os.path.abspath(dst), force_flat)
+            r = convert_one(src, os.path.abspath(dst), kind)
         except Exception as e:
             print('FAILED %s: %r' % (src, e), file=sys.stderr)
             r = 1

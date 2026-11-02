@@ -18,6 +18,11 @@
 // the clipboard, rasterize at 300dpi, trim whitespace, threshold to bilevel
 // and save as Group-4 TIFF (same recipe as the VSTO add-in's
 // BuildTrimmedTiffBytes, minus the document mutation).
+// Equations take the EMF from Range.EnhMetaFileBits instead when Word gives
+// it: the clipboard round trip costs 5-10 s per object over a remote-desktop
+// session (148 equations, 21 min; EnhMetaFileBits: 25 s, same
+// drawing and size). Tables stay on the clipboard: EnhMetaFileBits lays a
+// table wider than the text column out narrower than Word shows it.
 //
 // Uses late-bound Word COM (no interop assembly needed) and plain .NET 4.x.
 using System;
@@ -116,7 +121,7 @@ internal static class EqRender
                         continue;
                     }
                     range = om.Range.Duplicate;
-                    byte[] emf = CopyRangeAsEmf(range);
+                    byte[] emf = RangeEmfBits(range) ?? CopyRangeAsEmf(range);
                     if (emf == null || emf.Length == 0)
                     {
                         Console.Error.WriteLine("eq " + i + ": no EMF on clipboard");
@@ -213,6 +218,19 @@ internal static class EqRender
     }
 
     // --- clipboard ---------------------------------------------------------
+
+    private static byte[] RangeEmfBits(dynamic range)
+    {
+        try
+        {
+            byte[] b = range.EnhMetaFileBits as byte[];
+            return b != null && b.Length > 0 ? b : null;
+        }
+        catch
+        {
+            return null;
+        }
+    }
 
     private static byte[] CopyRangeAsEmf(dynamic range)
     {

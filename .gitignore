@@ -1,5 +1,7 @@
 __pycache__/
 *.pyc
+# bundled embeddable Python: shipped in the release zip, not in the repo
+/python/
 
 # conversion inputs/outputs — patent drafts are confidential, never commit them
 *.docx

@@ -10,7 +10,10 @@ for %%A in (%*) do echo   %%~A
 echo.
 rem --pause-on-review-error: python itself waits for Enter when the .hlt was
 rem made but its .rtf / .compare.docx review files were not
-python "%~dp0docx2hlt.py" --pause-on-review-error %*
+rem the bundled embeddable Python (python\) first, so no install is needed
+set "PY=python"
+if exist "%~dp0python\python.exe" set "PY=%~dp0python\python.exe"
+"%PY%" "%~dp0docx2hlt.py" --pause-on-review-error %*
 if errorlevel 1 (
   echo.
   echo *** CONVERSION FAILED ***

@@ -646,6 +646,8 @@ def nk_import_and_save_hlt(xml_path, base_name, launch_timeout=45,
                 else:
                     _user.PostMessageW(d, 0x0111, 1, 0)   # WM_COMMAND IDOK
         time.sleep(0.8)
+    if saved:
+        _settled(saved)
 
     if not keep_open and pid == proc.pid:
         # Only close the frame when it belongs to the process WE launched.
@@ -659,7 +661,25 @@ def nk_import_and_save_hlt(xml_path, base_name, launch_timeout=45,
     return saved
 
 
-def _close_with_prompts(pid, hwnd, timeout=8):
+def _settled(path, quiet=1.5, limit=60):
+    """Wait until `path` stops growing: the save loops see the file as soon
+    as NKEditor creates it, and an RTF export of a big document is still
+    being written then (a 영문 PCT spec) - a WM_CLOSE sent that early is
+    answered by the 'XML 변환' prompt only after the close loop gave up."""
+    t0 = time.time()
+    last = -1
+    while time.time() - t0 < limit:
+        try:
+            n = os.path.getsize(path)
+        except OSError:
+            return
+        if n == last:
+            return
+        last = n
+        time.sleep(quiet)
+
+
+def _close_with_prompts(pid, hwnd, timeout=30):
     """After WM_CLOSE, keep answering NKEditor's delayed close prompts
     ('XML 변환하시겠습니까?' etc.) with 아니요 until the frame is gone —
     a single dismiss misses prompts that appear a beat after the close."""
@@ -887,6 +907,8 @@ def nk_export_rtf(hlt_path, launch_timeout=45, save_timeout=30):
             _fail('RTF 저장 중', True)
         else:
             _fail('%d초 안에 rtf 파일이 생기지 않음' % save_timeout)
+    else:
+        _settled(saved)
     if pid == proc.pid and _user.IsWindow(hwnd):
         try:
             _user.PostMessageW(hwnd, 0x0010, 0, 0)   # WM_CLOSE our own frame
