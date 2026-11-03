@@ -64,13 +64,11 @@ Kind detection (`detect_kind`), first match wins:
 
 1. a 【의견내용】 marker -> opinion; a line starting with 【보정대상 항목】 /
    【보정방법】 / 【보정내용】 -> amend;
-2. filename contains 의견서 -> opinion, 보정서 -> amend (not in a foreign
-   case path such as `SP00004-IN0` / `_CN0_`: those are associate
-   letters);
-3. with patent-section headings: a `WO` country token anywhere in the path
-   (`SP00001-WO0`, `...-WO_SP00002`) -> pct; a `KR0`-style token in a
-   folder name (`P0000001-KR0`) -> spec (KR0 working drafts sometimes carry
-   PCT headings but were filed as domestic specs); PCT-only headings
+2. filename contains 의견서 -> opinion, 보정서 -> amend;
+3. with patent-section headings: a `WO` or `PCT` token anywhere in the path
+   (`SP00001-WO0`, `...-WO_SP00002`, `SP00003-PCT`) -> pct; a `KR` token
+   (`P0000001-KR0`, `-KR1`, `_KR_`) -> spec (KR working drafts sometimes
+   carry PCT headings but were filed as domestic specs); PCT-only headings
    (【청구의 범위】, 【기술적 해결방법】, 【발명의 실시를 위한 형태】,
    【발명의 실시를 위한 최선의 형태】, 【산업상 이용가능성】) -> pct; else spec;
 4. otherwise flat.
@@ -78,8 +76,10 @@ Kind detection (`detect_kind`), first match wins:
 English ST.36 headings (at least 3, outnumbering the Korean ones) mean
 pct_en before step 3, whatever the case folder says.
 
-The bare word "PCT" is not a signal (national-stage refs carry it too).
-Override with `--kind=spec|pct|pct_en|opinion|flat` (`--flat` =
+Only WO, PCT and KR are looked at: .hlt is for KIPO filings, so other
+country codes (national-stage and foreign cases) never need converting. A
+token is the code with no Latin letter right before or after it (digits
+may follow: `KR0`, `WO1`); WO/PCT win over KR. Override with `--kind=spec|pct|pct_en|opinion|flat` (`--flat` =
 `--kind=flat`).
 
 Headings the form has no element for (e.g. 【배경 및 요약】, 【Summary of

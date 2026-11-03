@@ -2368,16 +2368,12 @@ KIND_LABEL = {'spec': '국내 특허 명세서', 'pct': '국문 PCT 명세서',
 PCT_ONLY_HEADS = ('청구의범위', '기술적해결방법', '발명의실시를위한형태',
                   '발명의실시를위한최선의형태', '산업상이용가능성')
 AMEND_HEADS = ('보정대상항목', '보정방법', '보정내용')
-# country token of a PCT international application (SP00001-WO0, ...-WO_SP..).
-# The bare word PCT is not one: national-stage refs carry it too.
-WO_TOKEN = re.compile(r'(?<![A-Za-z])WO\d*(?![A-Za-z])')
-# domestic case folder (P0000001-KR0); folder names only — a PCT draft's own
-# filename may say "...-KR0 (SP00003-PCT)"
-KR_DIR_TOKEN = re.compile(r'(?<![A-Za-z])KR\d(?![0-9])')
-# foreign-case folders (SP00004-IN0, ..._CN0_...): their "의견서" docx files
-# are letters/reports for the foreign associate, not KIPO 의견서
-FOREIGN_TOKEN = re.compile(r'(?<![A-Za-z])(?:US|CN|JP|EP|IN|TW|DE|GB|FR|VN|BR|'
-                           r'CA|AU|MX|RU|ID|SG|PH|TH|MY)\d(?![0-9])')
+# case tokens in the path. Only KIPO filings become .hlt - the PCT
+# international application (SP00001-WO0, ...-WO_SP.., SP00003-PCT) and the
+# domestic application (P0000001-KR0) - so other country codes are not looked
+# at. PCT/WO wins over KR: a PCT draft's filename may say "...-KR0 (SP00003-PCT)".
+PCT_TOKEN = re.compile(r'(?<![A-Za-z])(?:WO|PCT)\d*(?![A-Za-z])')
+KR_TOKEN = re.compile(r'(?<![A-Za-z])KR\d*(?![A-Za-z])')
 
 
 def docx_lines(src):
@@ -2419,24 +2415,24 @@ def detect_kind(src, lines):
     # a KR 의견서 may quote 【청구항 N】 lines, and a 보정서 is often a bare
     # claim set — either would pass for a spec by its headings
     base = os.path.basename(src)
-    if not FOREIGN_TOKEN.search(os.path.abspath(src)):
-        if '의견서' in base:
-            return 'opinion', '파일명의 "의견서"'
-        if '보정서' in base:
-            return 'amend', '파일명의 "보정서"'
+    if '의견서' in base:
+        return 'opinion', '파일명의 "의견서"'
+    if '보정서' in base:
+        return 'amend', '파일명의 "보정서"'
     # English ST.36 headings (【Technical Field】, 【CLAIMS】, ...): only the
     # English PCT form uses them, whatever the case folder says
     if len(en_heads) >= 3 and len(en_heads) > len(heads):
         return 'pct_en', ', '.join(en_heads[:3])
     if heads:
-        # case-folder country token first: a KR0 working draft can carry PCT
-        # headings (a KR0 "Processing" docx) yet was filed as a domestic spec
-        tok = WO_TOKEN.search(os.path.abspath(src))
+        # case token first: a KR0 working draft can carry PCT headings
+        # (a KR0 "Processing" docx) yet was filed as a domestic spec
+        path = os.path.abspath(src)
+        tok = PCT_TOKEN.search(path)
         if tok:
-            return 'pct', '경로의 국가 토큰 %s' % tok.group(0)
-        kr = KR_DIR_TOKEN.search(os.path.dirname(os.path.abspath(src)))
-        if kr:
-            return 'spec', '사건 폴더의 국가 토큰 %s' % kr.group(0)
+            return 'pct', '경로의 사건 토큰 %s' % tok.group(0)
+        tok = KR_TOKEN.search(path)
+        if tok:
+            return 'spec', '경로의 사건 토큰 %s' % tok.group(0)
         if pct_heads:
             return 'pct', ', '.join(pct_heads[:3])
         return 'spec', '특허 섹션 제목'
