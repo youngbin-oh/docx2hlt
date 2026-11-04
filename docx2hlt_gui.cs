@@ -55,6 +55,7 @@ class MainForm : Form
         @"Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers";
     // docx2hlt.py prints these when the .hlt was made but something needs a look
     const string ReviewFailMark = "검토 파일(.rtf/.compare.docx)을 만들지 못했습니다";
+    const string ReviewNoteMark = "비교 문서에 확인할 점이 있습니다";
     const string StaleViewMark = "이미 열려 있던 NKEditor 창";
 
     readonly string here = AppDomain.CurrentDomain.BaseDirectory;
@@ -627,6 +628,11 @@ class MainForm : Form
             if (text.Contains(ReviewFailMark))
             {
                 state = "완료 (검토 파일 실패)";
+                color = Color.DarkOrange;
+            }
+            else if (text.Contains(ReviewNoteMark))
+            {
+                state = "완료 (비교 문서 확인 필요)";
                 color = Color.DarkOrange;
             }
             if (text.Contains(StaleViewMark))

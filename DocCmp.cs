@@ -87,6 +87,54 @@ public class DocCmp
         SetProp(dCmp, "TrackRevisions", false);
     }
 
+    // 【】 and [] dropped: the PCT form's rtf writes 【표 1】 as [표 1], and
+    // the compare doc then holds 【[표 1】] (old brackets deleted, new ones
+    // inserted), which the anchor text no longer matches as a whole
+    static string NoBrackets(string s)
+    {
+        return s.Replace("【", "").Replace("】", "").Replace("[", "")
+                .Replace("]", "").Trim();
+    }
+
+    // Range.Find for `text` in dCmp from `from` on; null when not found
+    static object FindFrom(object dCmp, int from, string text)
+    {
+        int docEnd = (int)Prop(Prop(dCmp, "Content"), "End");
+        if (from >= docEnd) return null;
+        object rng = Call(dCmp, "Range", from, docEnd);
+        object find = Prop(rng, "Find");
+        Call(find, "ClearFormatting");
+        SetProp(find, "Text", text.Replace("^", "^^"));
+        SetProp(find, "Forward", true);
+        SetProp(find, "Wrap", 0);            // wdFindStop
+        SetProp(find, "MatchWildcards", false);
+        SetProp(find, "MatchCase", true);
+        return (bool)Call(find, "Execute") ? rng : null;
+    }
+
+    // End of the compare-doc paragraph holding `anchor`, or -1. Falls back
+    // to the bracket-free text when only the brackets differ: that core must
+    // then be the whole paragraph, so "표 1" in body text is not taken.
+    static int FindAnchorEnd(object dCmp, int from, string anchor)
+    {
+        object rng = FindFrom(dCmp, from, anchor);
+        if (rng != null)
+            return (int)Prop(Prop(Call(Prop(rng, "Paragraphs"), "Item", 1),
+                                  "Range"), "End");
+        string core = NoBrackets(anchor);
+        if (core.Length == 0 || core == anchor) return -1;
+        for (int tries = 0; tries < 200; tries++)
+        {
+            rng = FindFrom(dCmp, from, core);
+            if (rng == null) return -1;
+            object pr = Prop(Call(Prop(rng, "Paragraphs"), "Item", 1), "Range");
+            if (NoBrackets(ParaText(pr)) == core)
+                return (int)Prop(pr, "End");
+            from = (int)Prop(rng, "End");
+        }
+        return -1;
+    }
+
     static int RestoreDeletedTables(object app, object dOrig, object dCmp)
     {
         object tables = Prop(dOrig, "Tables");
@@ -124,23 +172,14 @@ public class DocCmp
                 }
                 if (anchor.Length > 200) anchor = anchor.Substring(anchor.Length - 200);
                 int docEnd = (int)Prop(Prop(dCmp, "Content"), "End");
-                object rng = Call(dCmp, "Range", searchFrom, docEnd);
-                object find = Prop(rng, "Find");
-                Call(find, "ClearFormatting");
-                SetProp(find, "Text", anchor.Replace("^", "^^"));
-                SetProp(find, "Forward", true);
-                SetProp(find, "Wrap", 0);            // wdFindStop
-                SetProp(find, "MatchWildcards", false);
-                SetProp(find, "MatchCase", true);
-                if (!(bool)Call(find, "Execute"))
+                int p = FindAnchorEnd(dCmp, searchFrom, anchor);
+                if (p < 0)
                 {
                     Console.WriteLine("WARN table " + i + ": anchor '" +
                         (anchor.Length > 30 ? anchor.Substring(0, 30) : anchor) +
                         "' not found in the compare doc");
                     continue;
                 }
-                object para = Call(Prop(rng, "Paragraphs"), "Item", 1);
-                int p = (int)Prop(Prop(para, "Range"), "End");
                 searchFrom = p;
                 if (p >= docEnd) continue;
                 // the table survived the conversion: Word compared it already

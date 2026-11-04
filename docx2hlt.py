@@ -2065,6 +2065,7 @@ EQRENDER = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 
 WARNINGS = []             # conversion-level problems for the review report
 REVIEW_ISSUES = []        # why .rtf / .compare.docx were not produced
+REVIEW_NOTES = []         # .compare.docx made, but part of it needs a look
 
 
 def _decode_output(b):
@@ -2617,8 +2618,12 @@ def make_review(src, dst):
                                    capture_output=True, timeout=300)
             if r.returncode == 0 and os.path.exists(cand):
                 for ln in _decode_output(r.stdout).splitlines():
+                    # the compare doc exists: a WARN is a gap in it (e.g. a
+                    # table not shown as a tracked deletion), not a failure
                     if ln.startswith('WARN '):
-                        issue('비교 문서 - ' + ln[5:])
+                        print('review: 비교 문서 경고 - ' + ln[5:],
+                              file=sys.stderr)
+                        REVIEW_NOTES.append('비교 문서 - ' + ln[5:])
                     elif ln.startswith('tables shown'):
                         print('review: ' + ln)
                 print('review: compare doc ->', cand)
@@ -2637,6 +2642,7 @@ def convert_one(src, dst, kind=None):
     CHAR_REPORT.clear()
     del WARNINGS[:]
     del REVIEW_ISSUES[:]
+    del REVIEW_NOTES[:]
     if kind:
         why = '--kind 지정'
     else:
@@ -2797,6 +2803,7 @@ def main():
                 for a in args]
     rc = 0
     review_failed = []
+    review_noted = []
     stale_views = []
     for src, dst in jobs:
         if len(jobs) > 1:
@@ -2809,7 +2816,9 @@ def main():
         if r:
             rc = r
         elif REVIEW_ISSUES:
-            review_failed.append((src, list(REVIEW_ISSUES)))
+            review_failed.append((src, REVIEW_ISSUES + REVIEW_NOTES))
+        elif REVIEW_NOTES:
+            review_noted.append((src, list(REVIEW_NOTES)))
         # an editor the user already had open on the output still shows the
         # old document; saving there would overwrite the new .hlt
         if not r:
@@ -2828,6 +2837,14 @@ def main():
             print('  %s' % os.path.basename(src))
             for msg in issues:
                 print('    - %s' % msg)
+    if review_noted:
+        print()
+        print('*** 검토 파일은 만들어졌지만 비교 문서에 확인할 점이 '
+              '있습니다 ***')
+        for src, notes in review_noted:
+            print('  %s' % os.path.basename(src))
+            for msg in notes:
+                print('    - %s' % msg)
     if stale_views:
         print()
         print('*** 이미 열려 있던 NKEditor 창이 변환 전 .hlt를 보여 주고 '
@@ -2837,7 +2854,7 @@ def main():
                   % (os.path.basename(dst), ', '.join(map(str, pids))))
         print('  그 창에서 저장하면 새 .hlt를 덮어씁니다. 저장하지 말고 닫은 뒤 '
               '다시 여세요.')
-    if review_failed or stale_views:
+    if review_failed or review_noted or stale_views:
         if pause_on_review:
             try:
                 input('\nEnter 키를 누르면 창이 닫힙니다...')

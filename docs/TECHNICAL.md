@@ -399,8 +399,13 @@ Every conversion additionally produces, next to the `.hlt`:
   non-empty paragraph before it (e.g. 【표 1】) and deletes it with
   tracking on, and re-inserts the image paragraph(s) right after it as a
   tracked insertion. Tables that are still tables in the rtf (opinion
-  tables) are left to Word's own compare. An anchor DocCmp cannot find
-  is reported as a review issue.
+  tables) are left to Word's own compare. The anchor may differ only in
+  its brackets (the PCT form's rtf writes 【표 1】 as [표 1], so the compare
+  doc reads 【[표 1】]): DocCmp then takes the paragraph whose text without
+  【】[] equals the anchor's. An anchor it still cannot find leaves the
+  compare doc without that table; the run reports it separately ("검토
+  파일은 만들어졌지만 비교 문서에 확인할 점이 있습니다"), not as a
+  review-file failure.
 
 The export opens a byte-identical copy of the `.hlt` under a short temp
 path: NKEditor 6.3 (2026.10.22.01) crashes with heap corruption
