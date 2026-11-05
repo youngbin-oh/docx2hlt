@@ -132,6 +132,8 @@ folder is enough to install it on another PC.
   `name (2).hlt` there. The choice is kept per user in
   `%APPDATA%\docx2hlt\gui.ini`.
 - 문서 종류: 자동 판별 by default; the other entries pass `--kind=...`.
+- 이미지 자동 변환 (checked by default, kept in `gui.ini` as
+  `image_convert`): unchecked passes `--no-image-convert` (see Images).
 - Python: `python\python.exe` in this folder when bundled, otherwise
   `python.exe` on PATH (the WindowsApps store stub is skipped), then the
   `py` launcher. The window logs which one it uses and whether Pillow is
@@ -217,7 +219,7 @@ not synthesized by hand:
 1. `docx2hlt.py` parses the docx and detects patent sections
    (`_is_patent_doc`). For a patent doc it calls `build_patent_xml`,
    which maps each section to the KIPO **PatentCAFDOC** schema and
-   writes a `PatentCAFDOC` XML document plus `patNNNNN.jpg` images:
+   writes a `PatentCAFDOC` XML document plus `patNNNNN.tif` images:
    `description` → invention-title / technical-field / background-art /
    summary-of-invention{tech-problem, tech-solution, advantageous-effects}
    / description-of-drawings / description-of-embodiments, then `claims`,
@@ -241,10 +243,35 @@ not synthesized by hand:
      outside real identification items).
    - Images keep their position inside paragraphs (`<img>` spliced at
      the original text offset) — only images under a `【도 N】` heading
-     become `<drawings><figure>` elements. Images are emitted as-is for
-     TIFF/JPEG; near-bilevel art (equations, diagrams) becomes Group-4
-     TIFF, other content JPEG q92; `he`/`wi` are clamped to the
+     become `<drawings><figure>` elements. `he`/`wi` are clamped to the
      165×222mm KIPO page box (E-218).
+   - **Images (이미지 자동 변환, on by default)**: every image of a
+     spec / PCT / flat document is handed to NKEditor as a **1-bit
+     300dpi Group-4 TIFF** (`normalize_g4`) - drawings, equations,
+     tables and pictures alike. A TIFF that already is single-page
+     1-bit G4 at 300dpi passes through byte for byte; anything else
+     (PNG/JPEG/GIF/BMP/WMF/EMF, gray/color/uncompressed/LZW/G3 TIFFs,
+     TIFFs without or with another dpi) is rebuilt: transparency on
+     white; size = the docx display extent at 300dpi (clamped to the
+     page box; source dpi or source pixels when there is no extent;
+     within 3% only the dpi tag changes); line art (<25% midtones) is
+     thresholded on the darkest channel so light-colored lines stay
+     black, with a lower cutoff when downscaling so 1px lines survive;
+     continuous-tone pictures are Floyd-Steinberg dithered. Each
+     rebuilt image is listed in `.charset.txt/.docx` (source format,
+     mode, compression, dpi, size -> new size). NKEditor itself stores
+     the images uncompressed inside the .hlt body (the body as a whole
+     is deflated), so a G4 tag is not visible in the .hlt.
+   - `--no-image-convert` (GUI: uncheck 이미지 자동 변환) keeps images
+     as they are, for domestic filings with color/gray figures: TIFF
+     and JPEG pass through unchanged, other formats get the minimum
+     re-encode (near-bilevel -> G4 TIFF, else JPEG q92). A PCT document
+     converted this way gets a warning listing its non-bilevel images
+     (PCT accepts black-and-white only).
+   - 의견서 images are never normalized: they stay JPEG (`opnNNNNN.jpg`).
+   - An image Pillow cannot open (e.g. a bare SVG without Word's PNG
+     fallback) is left out with a warning (it used to be written raw
+     under a .jpg name).
 2. `nkwin.py` launches `NKEditor.exe <that xml>`. NKEditor imports the
    PatentCAFDOC XML and builds the native structured document tree.
    The driver waits for the structure pane's `SysTreeView32` to
@@ -347,8 +374,9 @@ paraFlags alignment group (mutually exclusive): 1=center, 2=right,
 - **Paragraph spacing** — space before/after (`w:spacing`)
 - Font size (`w:sz`, half-points → points) and text color (`w:color`);
   sizes resolve through `w:basedOn` style chains and `docDefaults`
-- **Embedded images/drawings** (PNG, JPEG, TIFF, GIF, BMP — normalized
-  to TIFF, anchored at their document position, embedded into the .hlt,
+- **Embedded images/drawings** (PNG, JPEG, TIFF, GIF, BMP — staged as
+  1-bit 300dpi G4 TIFF, or as uncompressed TIFF in their own mode with
+  `--no-image-convert`; anchored at their document position, embedded into the .hlt,
   rendered at the DOCX-specified display size via `TerSetPictSize`)
 - Tables are flattened to plain paragraphs (cell images are kept)
 - Long paragraphs (auto-split, render continuously)

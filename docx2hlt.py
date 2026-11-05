@@ -935,10 +935,12 @@ def _w_text(s):
                .replace('>', '&gt;')))
 
 
-def write_charset_docx(path, warnings, rows):
+def write_charset_docx(path, warnings, rows, notes=()):
     """Write the charset review report as a minimal Word document —
-    a heading, warning lines, then a table of
+    a heading, warning lines, image-conversion notes (first line bold,
+    the rest indented), then a table of
     코드포인트 | 원본 | 치환 | 문맥."""
+    from xml.sax.saxutils import escape as _esc
     trs = []
     hdr = ('<w:tr><w:trPr><w:tblHeader/></w:trPr>' +
            ''.join('<w:tc><w:p><w:r><w:rPr><w:b/></w:rPr>'
@@ -953,8 +955,13 @@ def write_charset_docx(path, warnings, rows):
                    '</w:tr>')
     warn_xml = ''.join(
         '<w:p><w:r><w:rPr><w:b/><w:color w:val="C00000"/></w:rPr>'
-        '<w:t xml:space="preserve">!! %s</w:t></w:r></w:p>' % w
+        '<w:t xml:space="preserve">!! %s</w:t></w:r></w:p>' % _esc(w)
         for w in warnings)
+    warn_xml += ''.join(
+        '<w:p>%s<w:r>%s<w:t xml:space="preserve">%s</w:t></w:r></w:p>' % (
+            '<w:pPr><w:ind w:left="400"/></w:pPr>' if k else '',
+            '' if k else '<w:rPr><w:b/></w:rPr>', _esc(n))
+        for k, n in enumerate(notes))
     doc = ('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
            '<w:document xmlns:w="http://schemas.openxmlformats.org/'
            'wordprocessingml/2006/main"><w:body>'
@@ -1237,18 +1244,31 @@ def runs_to_xml(runs):
     return ''.join(out)
 
 
-def _emit_figure_image(data, base):
-    """Write one figure image for the KIPO XML. Patent drawings are usually
-    tiny Group-4 TIFFs — TIFF and JPEG bytes pass through unchanged; other
-    formats are re-encoded (bilevel art -> Group-4 TIFF, else JPEG).
-    Returns (filename, img-format)."""
+def _emit_figure_image(data, base, cx=None, cy=None, label=''):
+    """Write one figure image for the KIPO XML. Returns (filename,
+    img-format). IMAGE_CONVERT on (default): every image becomes a 1-bit
+    300dpi Group-4 TIFF (normalize_g4). Off (--no-image-convert, for a
+    domestic filing that keeps color or gray images): TIFF and JPEG pass
+    through unchanged and other formats get the minimum re-encode the XML
+    needs (near-bilevel art -> Group-4 TIFF, else JPEG q92)."""
+    if IMAGE_CONVERT:
+        tif = normalize_g4(data, cx, cy, label)
+        with open(base + '.tif', 'wb') as fh:
+            fh.write(tif)
+        return os.path.basename(base) + '.tif', 'tif'
     if data[:4] in (b'II*\x00', b'MM\x00*'):
         with open(base + '.tif', 'wb') as fh:
             fh.write(data)
+        try:
+            if Image.open(io.BytesIO(data)).mode != '1':
+                ASIS_NOT_BW.append(label)
+        except Exception:
+            pass
         return os.path.basename(base) + '.tif', 'tif'
     if data[:3] == b'\xff\xd8\xff':
         with open(base + '.jpg', 'wb') as fh:
             fh.write(data)
+        ASIS_NOT_BW.append(label)
         return os.path.basename(base) + '.jpg', 'jpg'
     im = open_media(data)
     if im.mode != '1':
@@ -1268,6 +1288,7 @@ def _emit_figure_image(data, base):
         im.save(base + '.tif', 'TIFF', compression='group4')
         return os.path.basename(base) + '.tif', 'tif'
     im.save(base + '.jpg', 'JPEG', quality=92)
+    ASIS_NOT_BW.append(label)
     return os.path.basename(base) + '.jpg', 'jpg'
 
 
@@ -1449,17 +1470,22 @@ def build_patent_xml(src, paras, outdir, imgfiles, xml_name='spec.xml',
             except Exception:
                 return ''
         if tgt in emitted_files:
+            if emitted_files[tgt] is None:
+                return ''
             fname, fmt = emitted_files[tgt]
         else:
             file_seq[0] += 1
             base = os.path.join(outdir, 'pat%05d' % file_seq[0])
             try:
-                fname, fmt = _emit_figure_image(data, base)
-            except Exception:
-                fname = 'pat%05d.jpg' % file_seq[0]
-                with open(os.path.join(outdir, fname), 'wb') as fh:
-                    fh.write(data)
-                fmt = 'jpg'
+                fname, fmt = _emit_figure_image(data, base, cx, cy,
+                                                _img_label(tgt))
+            except Exception as e:
+                # an image Pillow can't open (e.g. a bare SVG) used to be
+                # written raw under a .jpg name - leave it out and say so
+                WARNINGS.append('그림 %s: 열 수 없는 형식이라 빠짐 (%s)'
+                                % (_img_label(tgt), type(e).__name__))
+                emitted_files[tgt] = None
+                return ''
             emitted_files[tgt] = (fname, fmt)
         img_id[0] += 1
         wi, he = emu_mm(cx), emu_mm(cy)
@@ -1709,6 +1735,8 @@ def build_opinion_xml(src, blocks, outdir, imgfiles, xml_name='opinion.xml'):
                     data = fh.read()
             except Exception:
                 return ''
+        # 의견서 images are not normalized to G4 (user rule 2026-11-05):
+        # they stay JPEG as before, color included
         seq[0] += 1
         fname = 'opn%05d.jpg' % seq[0]
         path = os.path.join(outdir, fname)
@@ -2029,12 +2057,176 @@ def open_media(data):
     return im
 
 
-def media_to_tiff(data, out_tif):
-    """Convert image bytes to an uncompressed TIFF at out_tif via Pillow.
+G4_DPI = 300                  # KIPO submission images: 1-bit, 300dpi, Group 4
+PAGE_MM = (165.0, 222.0)      # KIPO page box (E-218)
+# image normalization record of the XML build: {'ok': [label], 'fixed':
+# [note]}; the flat path's staging keeps its own until it is the one used
+IMG_REPORT = {'ok': [], 'fixed': []}
+FLAT_IMG_REPORT = {'ok': [], 'fixed': []}
+# 이미지 자동 변환: on -> every spec/PCT/flat image becomes 1-bit 300dpi G4
+# TIFF; off (--no-image-convert / GUI checkbox) -> images go in as they are
+# (domestic filings may carry color). 의견서 images are never normalized.
+IMAGE_CONVERT = True
+ASIS_NOT_BW = []              # with conversion off: gray/color images kept
 
-    The TE save path embeds TIFF verbatim but must ImageGear-decode PNG/JPEG —
-    which fails on palette/odd PNGs. Staging a TIFF makes the embed reliable.
+
+def _img_label(tgt):
+    """Short name of a media target for reports ('image3.png', '수식 7')."""
+    if tgt.startswith('@eq'):
+        return '수식 ' + tgt[3:]
+    if tgt.startswith('@tbl'):
+        return '표 ' + tgt[4:]
+    return os.path.basename(tgt)
+
+
+def _img_desc(im, data):
+    """'PNG RGB 96dpi 400x300' style description of a source image."""
+    fmt = im.format or ('TIFF' if data[:4] in (b'II*\x00', b'MM\x00*') else
+                        'WMF' if data[:4] == b'\xd7\xcd\xc6\x9a' else
+                        'EMF' if data[40:44] == b' EMF' else '?')
+    comp = im.info.get('compression')
+    dpi = _src_dpi(im)
+    bits = {'1': '1비트', 'L': '회색조', 'P': '팔레트', 'RGB': '컬러',
+            'RGBA': '컬러(투명)', 'LA': '회색조(투명)', 'CMYK': 'CMYK'
+            }.get(im.mode, im.mode)
+    parts = [fmt, bits]
+    if fmt == 'TIFF':
+        parts.append({'group4': 'G4', 'raw': '무압축', 'tiff_lzw': 'LZW',
+                      'group3': 'G3', 'packbits': 'PackBits',
+                      'tiff_adobe_deflate': 'Deflate', 'jpeg': 'JPEG압축'
+                      }.get(comp, comp or '무압축'))
+    parts.append('%ddpi' % round(dpi[0]) if dpi and dpi[0] else 'dpi없음')
+    parts.append('%dx%d' % im.size)
+    return ' '.join(parts)
+
+
+def _src_dpi(im):
+    """(xdpi, ydpi) of a source image, None when absent - Pillow reports a
+    TIFF without ResolutionUnit as 1 dpi, which is no resolution at all."""
+    dpi = im.info.get('dpi')
+    if dpi and len(dpi) == 2 and dpi[0] >= 50 and dpi[1] >= 50:
+        return dpi
+    return None
+
+
+def _is_g4_300(im, data):
+    dpi = _src_dpi(im)
+    return (data[:4] in (b'II*\x00', b'MM\x00*') and im.mode == '1'
+            and im.info.get('compression') == 'group4'
+            and bool(dpi) and abs(dpi[0] - G4_DPI) < 1
+            and abs(dpi[1] - G4_DPI) < 1
+            and getattr(im, 'n_frames', 1) == 1)
+
+
+def normalize_g4(data, cx=None, cy=None, label='', report=None):
+    """Return docx image bytes as a 1-bit 300dpi Group-4 TIFF - the one
+    image format of a KIPO submission (equations, tables and drawings
+    alike). A TIFF that already is single-page 1-bit G4 at 300dpi passes
+    through byte for byte; anything else (PNG/JPEG/GIF/BMP/WMF/EMF, and
+    TIFFs that are gray, color, uncompressed, LZW, G3 or not 300dpi) is
+    rebuilt and listed in the review report:
+      - transparency is flattened onto white;
+      - size: the display extent (cx, cy EMU, clamped to the 165x222mm page
+        box like the XML he/wi) at 300dpi; without an extent the source
+        dpi, without a dpi the source pixels. Within 3% of the current size
+        only the dpi tag changes (no resampling of finished drawings);
+      - line art (<25% midtone pixels: drawings, equations, tables,
+        antialiased text) is thresholded on the darkest channel, so thin
+        or light-colored lines stay black; downscaling lowers the cutoff
+        towards white so 1px lines survive;
+      - continuous-tone content (photos, gradients) is Floyd-Steinberg
+        dithered from luminance and reported, since it changes look.
+    report: dict collecting 'ok' labels / 'fixed' notes (IMG_REPORT)."""
+    from PIL import ImageChops
+    if report is None:
+        report = IMG_REPORT
+    im = open_media(data)
+    if _is_g4_300(im, data):
+        report['ok'].append(label)
+        return data
+    before = _img_desc(im, data)
+    src_dpi = _src_dpi(im)
+    if getattr(im, 'n_frames', 1) > 1:
+        im.seek(0)
+    if im.mode in ('RGBA', 'LA', 'P', 'PA') or 'transparency' in im.info:
+        rgba = im.convert('RGBA')
+        bg = Image.new('RGB', im.size, 'white')
+        bg.paste(rgba, mask=rgba.split()[3])
+        im = bg
+    elif im.mode == '1':
+        im = im.convert('L')
+    elif im.mode not in ('L', 'RGB'):
+        im = im.convert('RGB')          # CMYK, I;16, ...
+
+    # target pixel size at 300dpi
+    w0, h0 = im.size
+    tw, th = w0, h0
+    if cx and cy and cx > 0 and cy > 0:
+        wmm, hmm = cx / 36000.0, cy / 36000.0
+        if wmm > PAGE_MM[0] or hmm > PAGE_MM[1]:
+            s = min(PAGE_MM[0] / wmm, PAGE_MM[1] / hmm)
+            wmm, hmm = wmm * s, hmm * s
+        tw = max(1, int(round(wmm / 25.4 * G4_DPI)))
+        th = max(1, int(round(hmm / 25.4 * G4_DPI)))
+    else:
+        if src_dpi and src_dpi[0] and src_dpi[1]:
+            tw = max(1, int(round(w0 * G4_DPI / float(src_dpi[0]))))
+            th = max(1, int(round(h0 * G4_DPI / float(src_dpi[1]))))
+    if abs(tw - w0) <= 0.03 * w0 and abs(th - h0) <= 0.03 * h0:
+        tw, th = w0, h0
+
+    lum = im.convert('L')
+    hist = lum.histogram()
+    tot = w0 * h0 or 1
+    photo = sum(hist[56:200]) > 0.25 * tot
+    if photo:
+        g = lum if (tw, th) == (w0, h0) else lum.resize((tw, th), Image.LANCZOS)
+        out = g.convert('1')            # Floyd-Steinberg dither
+        how = '디더링(사진/명암 그림)'
+    else:
+        if im.mode == 'RGB':
+            r, gch, b = im.split()
+            g = ImageChops.darker(ImageChops.darker(r, gch), b)
+        else:
+            g = lum
+        scale = min(tw / float(w0), th / float(h0))
+        if (tw, th) != (w0, h0):
+            g = g.resize((tw, th), Image.LANCZOS)
+        cut = 128 if scale >= 1 else min(200, int(255 * (1 - 0.5 * scale)))
+        out = g.point(lambda v, c=cut: 255 if v >= c else 0, '1')
+        how = '흑백 변환'
+    buf = io.BytesIO()
+    out.save(buf, 'TIFF', compression='group4', dpi=(G4_DPI, G4_DPI))
+    report['fixed'].append('그림 %s: %s -> 1비트 G4 300dpi %dx%d (%s)' % (
+        label or '?', before, tw, th, how))
+    return buf.getvalue()
+
+
+def image_report_lines(report):
+    """Review-report lines for one IMG_REPORT: a count line, then every
+    image that had to be converted (repeats of one image listed once)."""
+    fixed = list(dict.fromkeys(report['fixed']))
+    ok = len(set(report['ok']))
+    if not fixed:
+        return []
+    return (['그림 %d개를 1비트 G4 300dpi TIFF로 바꿈 (이미 규격에 맞는 그림 %d개는 '
+             '그대로 둠)' % (len(fixed), ok)] + fixed)
+
+
+def media_to_tiff(data, out_tif, label=''):
+    """Stage image bytes as a TIFF at out_tif for the flat TerConv path (the
+    TE save path embeds TIFF verbatim but must ImageGear-decode PNG/JPEG,
+    which fails on palette/odd PNGs). IMAGE_CONVERT on: a 1-bit 300dpi
+    Group-4 TIFF; off: an uncompressed TIFF in the source's own mode.
     Returns True on success."""
+    if IMAGE_CONVERT:
+        try:
+            tif = normalize_g4(data, label=label, report=FLAT_IMG_REPORT)
+            with open(out_tif, 'wb') as fh:
+                fh.write(tif)
+            return True
+        except Exception:
+            return False
     try:
         im = open_media(data)
     except Exception:
@@ -2318,7 +2510,7 @@ def parse_docx(path, imgdir, eqs=None, tbls=None, blocks=False):
                 # stage as TIFF so the HIF embed path works for every format
                 # (append .tif to the full basename to keep names unique)
                 tif = os.path.join(imgdir, base + '.tif')
-                if HAVE_PIL and media_to_tiff(data, tif):
+                if HAVE_PIL and media_to_tiff(data, tif, base):
                     imgfiles[name] = tif
                 else:
                     tgt = os.path.join(imgdir, base)
@@ -2643,6 +2835,11 @@ def convert_one(src, dst, kind=None):
     del WARNINGS[:]
     del REVIEW_ISSUES[:]
     del REVIEW_NOTES[:]
+    for rep_ in (IMG_REPORT, FLAT_IMG_REPORT):
+        rep_['ok'][:] = []
+        rep_['fixed'][:] = []
+    del ASIS_NOT_BW[:]
+    img_lines = []              # image_report_lines() of the path used
     if kind:
         why = '--kind 지정'
     else:
@@ -2663,7 +2860,7 @@ def convert_one(src, dst, kind=None):
         paras = split_glued_headings(paras, en=(kind == 'pct_en'))
 
     def write_report():
-        if not (CHAR_REPORT or WARNINGS):
+        if not (CHAR_REPORT or WARNINGS or img_lines):
             # clean state: remove reports from a previous run so stale
             # warnings can't be mistaken for problems in THIS output
             for stale in (os.path.splitext(dst)[0] + '.charset.txt',
@@ -2683,13 +2880,18 @@ def convert_one(src, dst, kind=None):
                 f.write('!! %s\n' % w)
             if WARNINGS:
                 f.write('\n')
+            for k, ln in enumerate(img_lines):
+                f.write('%s%s\n' % ('   ' if k else '', ln))
+            if img_lines:
+                f.write('\n')
             f.write('chars not representable in KIPO editor — substituted or '
                     'dropped during conversion\n\n')
             for orig, repl, ctx in CHAR_REPORT:
                 f.write('U+%04X %r -> %r   …%s\n' %
                         (ord(orig), orig, repl or '(삭제)', ctx))
         try:
-            write_charset_docx(stem + '.charset.docx', WARNINGS, CHAR_REPORT)
+            write_charset_docx(stem + '.charset.docx', WARNINGS, CHAR_REPORT,
+                               img_lines)
         except Exception as e:
             print('review: charset docx write failed (%r)' % e,
                   file=sys.stderr)
@@ -2710,11 +2912,25 @@ def convert_one(src, dst, kind=None):
             if convert_structured(src, dst,
                                   blocks if kind == 'opinion' else paras,
                                   imgfiles, kind):
-                if len(WARNINGS) > n_warn:
+                img_lines[:] = image_report_lines(IMG_REPORT)
+                if not IMAGE_CONVERT and kind != 'opinion':
+                    print('images: 자동 변환 꺼짐 - 그림을 원래 형식대로 넣음')
+                    kept = list(dict.fromkeys(ASIS_NOT_BW))
+                    if kind in ('pct', 'pct_en') and kept:
+                        WARNINGS.append(
+                            'PCT 출원인데 이미지 자동 변환이 꺼져 있어 흑백이 '
+                            '아닌 그림 %d개가 그대로 들어감 (PCT는 흑백만 허용): '
+                            '%s' % (len(kept), ', '.join(kept[:10])))
+                if len(WARNINGS) > n_warn or img_lines:
                     # the XML build / PCT kind step can add warnings
                     for w in WARNINGS[n_warn:]:
                         print('WARNING: %s' % w, file=sys.stderr)
+                    if img_lines:
+                        print('images: ' + img_lines[0])
                     write_report()
+                if IMAGE_CONVERT and not img_lines and IMG_REPORT['ok']:
+                    print('images: 그림 %d개 모두 1비트 G4 300dpi TIFF 규격에 '
+                          '맞음' % len(set(IMG_REPORT['ok'])))
                 done = True
             else:
                 done = False
@@ -2764,6 +2980,21 @@ def convert_one(src, dst, kind=None):
         print('ERROR: output not created', file=sys.stderr)
         return 1
     print('OK ->', dst)
+    # staging converted every word/media file; report only the ones the
+    # body actually uses (unreferenced leftovers are not in the .hlt)
+    used = set(_img_label(tgt) for _r, ims, _p in paras for (tgt, *_x) in ims)
+    for k in ('ok', 'fixed'):
+        FLAT_IMG_REPORT[k][:] = [e for e in FLAT_IMG_REPORT[k]
+                                 if (e if k == 'ok' else
+                                     e[len('그림 '):].split(': ', 1)[0])
+                                 in used]
+    img_lines[:] = image_report_lines(FLAT_IMG_REPORT)
+    if img_lines:
+        print('images: ' + img_lines[0])
+        write_report()
+    elif IMAGE_CONVERT and FLAT_IMG_REPORT['ok']:
+        print('images: 그림 %d개 모두 1비트 G4 300dpi TIFF 규격에 맞음'
+              % len(set(FLAT_IMG_REPORT['ok'])))
     make_review(src, dst)
     return 0
 
@@ -2787,11 +3018,15 @@ def main():
     # the Explorer right-click wrapper passes this: its console closes on its
     # own after a successful conversion, which hid every review failure
     pause_on_review = '--pause-on-review-error' in sys.argv[1:]
+    global IMAGE_CONVERT
+    IMAGE_CONVERT = '--no-image-convert' not in sys.argv[1:]
     if not args:
         print('usage: docx2hlt.py input.docx [output.hlt] [more.docx ...]')
         print('  output omitted -> <input>.hlt written next to each input')
         print('  --kind=spec|pct|pct_en|opinion|flat  override the detected kind '
               '(--flat = --kind=flat)')
+        print('  --no-image-convert  이미지 자동 변환 끄기: 그림을 1비트 300dpi '
+              'G4 TIFF로 바꾸지 않고 원래 형식대로 넣음 (국내 출원 컬러 그림)')
         return 2
     # explicit output only in the classic 2-arg form; otherwise every arg is
     # a .docx and each writes <same name>.hlt in its own folder. Conversions

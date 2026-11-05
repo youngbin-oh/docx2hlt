@@ -80,6 +80,7 @@ class MainForm : Form
     TextBox txtOut;
     Button btnBrowse, btnAdd, btnCancel, btnClear, btnOpen;
     ComboBox cmbKind;
+    CheckBox chkImg;
     ToolStripStatusLabel status;
 
     // log line state: docx2hlt.py redraws its progress line with '\r'
@@ -142,7 +143,7 @@ class MainForm : Form
         grid.Dock = DockStyle.Fill;
         grid.AutoSize = true;
         grid.ColumnCount = 4;
-        grid.RowCount = 3;
+        grid.RowCount = 4;
         grid.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         grid.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         grid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
@@ -178,6 +179,18 @@ class MainForm : Form
         cmbKind.SelectedIndex = 0;
         grid.Controls.Add(cmbKind, 1, 2);
         grid.SetColumnSpan(cmbKind, 2);
+        // on: every image becomes 1-bit 300dpi G4 TIFF (PCT allows nothing
+        // else); off: images go in as they are, e.g. color figures of a
+        // domestic filing. 의견서 images are never converted.
+        grid.Controls.Add(MakeLabel("이미지:"), 0, 3);
+        chkImg = new CheckBox();
+        chkImg.Text = "이미지 자동 변환 (모든 그림을 1비트 300dpi G4 TIFF로, " +
+                      "의견서 제외) - 국내 출원에 컬러 그림을 넣으려면 끄세요";
+        chkImg.AutoSize = true;
+        chkImg.Checked = true;
+        grid.Controls.Add(chkImg, 1, 3);
+        grid.SetColumnSpan(chkImg, 3);
+        chkImg.CheckedChanged += delegate { SaveSettings(); };
         opt.Controls.Add(grid);
         root.Controls.Add(opt, 0, 1);
         rbCustom.CheckedChanged += delegate { OutModeChanged(); };
@@ -509,7 +522,8 @@ class MainForm : Form
         SetStatus(string.Format("변환 중 ({0}/{1}): {2}", done + 1, total,
                                 Path.GetFileName(job.Src)));
         var kind = KindArg();
-        new Thread(delegate () { RunJob(job, kind); }) { IsBackground = true }.Start();
+        var imgConvert = chkImg.Checked;
+        new Thread(delegate () { RunJob(job, kind, imgConvert); }) { IsBackground = true }.Start();
     }
 
     string ComputeDst(string src)
@@ -565,7 +579,7 @@ class MainForm : Form
 
     static string Q(string s) { return "\"" + s + "\""; }
 
-    void RunJob(Job job, string kind)
+    void RunJob(Job job, string kind, bool imgConvert)
     {
         var started = DateTime.Now;
         var output = new StringBuilder();
@@ -581,7 +595,8 @@ class MainForm : Form
             // which would wait for Enter on a console nobody sees
             var args = pythonPrefix + Q(Path.Combine(here, "docx2hlt.py")) + " " +
                        Q(job.Src) + " " + Q(job.Dst) +
-                       (kind != null ? " --kind=" + kind : "");
+                       (kind != null ? " --kind=" + kind : "") +
+                       (imgConvert ? "" : " --no-image-convert");
             using (var p = Process.Start(NewPsi(pythonExe, args)))
             {
                 proc = p;
@@ -870,7 +885,7 @@ class MainForm : Form
         {
             if (!File.Exists(iniPath))
                 return;
-            string mode = null, dir = null;
+            string mode = null, dir = null, img = null;
             foreach (var line in File.ReadAllLines(iniPath, Encoding.UTF8))
             {
                 var i = line.IndexOf('=');
@@ -879,11 +894,15 @@ class MainForm : Form
                 var val = line.Substring(i + 1).Trim();
                 if (key == "out_mode") mode = val;
                 else if (key == "out_dir") dir = val;
+                else if (key == "image_convert") img = val;
             }
             if (!string.IsNullOrEmpty(dir))
                 txtOut.Text = dir;
             if (mode == "custom" && txtOut.Text.Length > 0)
                 rbCustom.Checked = true;
+            // after the folder fields: its CheckedChanged saves the settings
+            if (img == "0")
+                chkImg.Checked = false;
         }
         catch { }
         txtOut.Enabled = btnBrowse.Enabled = rbCustom.Checked;
@@ -896,7 +915,8 @@ class MainForm : Form
             Directory.CreateDirectory(Path.GetDirectoryName(iniPath));
             File.WriteAllLines(iniPath, new[] {
                 "out_mode=" + (rbCustom.Checked ? "custom" : "same"),
-                "out_dir=" + txtOut.Text }, Encoding.UTF8);
+                "out_dir=" + txtOut.Text,
+                "image_convert=" + (chkImg.Checked ? "1" : "0") }, Encoding.UTF8);
         }
         catch { }
     }
