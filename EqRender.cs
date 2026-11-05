@@ -24,6 +24,10 @@
 // drawing and size). Tables stay on the clipboard: EnhMetaFileBits lays a
 // table wider than the text column out narrower than Word shows it.
 //
+// Tables are saved in gray (LZW TIFF, tblNNNN.tif): docx2hlt makes them
+// 1-bit itself so cell shading becomes a dot screen instead of vanishing
+// (light) or turning into a black block over the text (25% and darker).
+//
 // Uses late-bound Word COM (no interop assembly needed) and plain .NET 4.x.
 using System;
 using System.Drawing;
@@ -186,7 +190,10 @@ internal static class EqRender
                     }
                     string tif = Path.Combine(outdir, string.Format("tbl{0:D4}.tif", topLvl));
                     float wmm, hmm;
-                    SaveTrimmedTiff(emf, tif, out wmm, out hmm);
+                    // gray, not 1-bit: docx2hlt turns cell shading into a
+                    // dot screen (a plain threshold made light shading
+                    // vanish and 25%+ shading a black block hiding the text)
+                    SaveTrimmedTiff(emf, tif, out wmm, out hmm, true);
                     tmap.WriteLine(topLvl + "\t" + Mm(wmm) + "\t" + Mm(hmm));
                     tblRendered++;
                 }
@@ -401,7 +408,8 @@ internal static class EqRender
     // --- render + trim + save ----------------------------------------------
 
     private static void SaveTrimmedTiff(byte[] emfBytes, string outTif,
-                                        out float wMm, out float hMm)
+                                        out float wMm, out float hMm,
+                                        bool gray = false)
     {
         string tmp = Path.Combine(Path.GetTempPath(), "eqr_" + Guid.NewGuid().ToString("N") + ".emf");
         wMm = hMm = 0;
@@ -441,10 +449,20 @@ internal static class EqRender
                         throw new InvalidOperationException("empty render");
                     }
                     using (Bitmap cropped = bmp.Clone(bounds, bmp.PixelFormat))
-                    using (Bitmap mono = ToMonochrome(cropped))
                     {
-                        mono.SetResolution(Dpi, Dpi);
-                        SaveGroup4(mono, outTif);
+                        if (gray)
+                        {
+                            cropped.SetResolution(Dpi, Dpi);
+                            SaveLzw(cropped, outTif);
+                        }
+                        else
+                        {
+                            using (Bitmap mono = ToMonochrome(cropped))
+                            {
+                                mono.SetResolution(Dpi, Dpi);
+                                SaveGroup4(mono, outTif);
+                            }
+                        }
                         // display size = physical size scaled by trim ratio
                         wMm = origWmm * (float)bounds.Width / w;
                         hMm = origHmm * (float)bounds.Height / h;
@@ -552,6 +570,20 @@ internal static class EqRender
             ep.Param[0] = new EncoderParameter(
                 System.Drawing.Imaging.Encoder.Compression,
                 Convert.ToInt64(EncoderValue.CompressionCCITT4));
+            img.Save(path, codec, ep);
+        }
+    }
+
+    // color/gray render for docx2hlt's own bilevel step (tables)
+    private static void SaveLzw(Image img, string path)
+    {
+        ImageCodecInfo codec = ImageCodecInfo.GetImageEncoders()
+            .FirstOrDefault(c => c.FormatID == ImageFormat.Tiff.Guid);
+        using (var ep = new EncoderParameters(1))
+        {
+            ep.Param[0] = new EncoderParameter(
+                System.Drawing.Imaging.Encoder.Compression,
+                Convert.ToInt64(EncoderValue.CompressionLZW));
             img.Save(path, codec, ep);
         }
     }

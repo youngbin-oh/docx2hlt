@@ -168,7 +168,8 @@ folder is enough to install it on another PC.
   into NKEditor and triggers Save-As (structured path).
 - **Microsoft Word** — needed when the docx contains OMML equations
   (`m:oMath`) or tables (`w:tbl`): `EqRender.exe` renders each
-  equation **and each table** to a trimmed 300dpi G4 TIFF via
+  equation **and each table** to a trimmed 300dpi TIFF (equations G4;
+  tables gray, made 1-bit G4 with dot-screen shading by docx2hlt) via
   `Range.CopyAsPicture` → clipboard EMF → rasterize → crop. Tables keep
   their full visual layout (grid, borders, merged cells) as an inline
   image at their original document position — the alternative
@@ -254,10 +255,11 @@ not synthesized by hand:
      TIFFs without or with another dpi) is rebuilt: transparency on
      white; size = the docx display extent at 300dpi (clamped to the
      page box; source dpi or source pixels when there is no extent;
-     within 3% only the dpi tag changes); line art (<25% midtones) is
-     thresholded on the darkest channel so light-colored lines stay
-     black, with a lower cutoff when downscaling so 1px lines survive;
-     continuous-tone pictures are Floyd-Steinberg dithered. Each
+     within 3% only the dpi tag changes); line art is made 1-bit by
+     `to_bilevel` on the darkest channel (light-colored lines stay
+     black, a lower cutoff when downscaling keeps 1px lines); photos and
+     gradients (mid-gray spread over many levels) are Floyd-Steinberg
+     dithered. Each
      rebuilt image is listed in `.charset.txt/.docx` (source format,
      mode, compression, dpi, size -> new size). NKEditor itself stores
      the images uncompressed inside the .hlt body (the body as a whole
@@ -268,7 +270,30 @@ not synthesized by hand:
      re-encode (near-bilevel -> G4 TIFF, else JPEG q92). A PCT document
      converted this way gets a warning listing its non-bilevel images
      (PCT accepts black-and-white only).
+   - **Shading (`to_bilevel`)**: flat mid-gray areas - table cell
+     shading, gray box fills - become a clustered dot screen (6px cell =
+     50 lpi at 300dpi) whose coverage follows the gray (up to 40%;
+     lighter than 240, i.e. 5% shading, stays white; darker than 100
+     stays solid black, as for white-on-dark cells). Text and lines are
+     black when darker than the cutoff scaled to their local background,
+     so text on a shaded cell keeps its weight with a thin clear rim. A
+     plain threshold used to make light shading vanish and 25%+ shading a
+     black block hiding the text. Tables get this too: EqRender saves
+     them in gray and docx2hlt makes them 1-bit G4 (whatever the image
+     option); the log says how many tables had shading.
    - 의견서 images are never normalized: they stay JPEG (`opnNNNNN.jpg`).
+   - **Body compression**: header byte 0x17 says whether the .hlt body
+     (from 0x108) is compressed (01) or stored (00); NKEditor writes either
+     according to its own 압축 저장 option (`[SAVE] COMPRESS` in
+     `C:\KipoNet\NKEditor\NKEditer.ini`), so one docx gave 0.5 MB on one
+     PC and 7 MB on another with identical content. docx2hlt compresses a
+     stored body itself (`compress_hlt`) right after the save, in NKEditor's
+     layout: raw deflate with a **4 KB window** + CRC32 + uncompressed
+     length (u32 LE each). Both details matter: with a 32 KB window or
+     without the trailer NKEditor opens the file but silently loads only
+     its first part. The stream is inflated back and checked before it
+     replaces the file, and the review .rtf is exported from the
+     compressed file (identical RTF to the stored original, verified).
    - An image Pillow cannot open (e.g. a bare SVG without Word's PNG
      fallback) is left out with a warning (it used to be written raw
      under a .jpg name).

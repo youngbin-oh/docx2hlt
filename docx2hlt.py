@@ -16,6 +16,7 @@ import sys
 import time
 import tempfile
 import zipfile
+import zlib
 from xml.etree import ElementTree as ET
 
 try:
@@ -2180,6 +2181,11 @@ def normalize_g4(data, cx=None, cy=None, label='', report=None):
     tot = w0 * h0 or 1
     photo = sum(hist[56:200]) > 0.25 * tot
     if photo:
+        # mostly mid-gray: a photo/gradient, or line art on large flat
+        # fills (gray boxes, shaded panels) - the latter keeps crisp text
+        # and a dot screen through to_bilevel instead of dithering
+        photo = not _is_shading_not_photo(lum)
+    if photo:
         g = lum if (tw, th) == (w0, h0) else lum.resize((tw, th), Image.LANCZOS)
         out = g.convert('1')            # Floyd-Steinberg dither
         how = '디더링(사진/명암 그림)'
@@ -2193,13 +2199,101 @@ def normalize_g4(data, cx=None, cy=None, label='', report=None):
         if (tw, th) != (w0, h0):
             g = g.resize((tw, th), Image.LANCZOS)
         cut = 128 if scale >= 1 else min(200, int(255 * (1 - 0.5 * scale)))
-        out = g.point(lambda v, c=cut: 255 if v >= c else 0, '1')
-        how = '흑백 변환'
+        out = to_bilevel(g, cut)
+        how = '흑백 변환' + (', 음영은 점무늬' if _has_shading(g) else '')
     buf = io.BytesIO()
     out.save(buf, 'TIFF', compression='group4', dpi=(G4_DPI, G4_DPI))
     report['fixed'].append('그림 %s: %s -> 1비트 G4 300dpi %dx%d (%s)' % (
         label or '?', before, tw, th, how))
     return buf.getvalue()
+
+
+SHADE_CELL = 6               # dot-screen cell (px at 300dpi = 0.5 mm, 50 lpi)
+
+
+def _screen_matrix(n=SHADE_CELL):
+    """Clustered-dot threshold matrix (values 0..255): a dot grows from the
+    cell centre outwards, so a shade prints as round dots on a regular
+    grid (compresses well in G4, unlike dispersed dither)."""
+    c = (n - 1) / 2.0
+    cells = sorted(((x - c) ** 2 + (y - c) ** 2, y, x)
+                   for y in range(n) for x in range(n))
+    m = [[0] * n for _ in range(n)]
+    for k, (_d, y, x) in enumerate(cells):
+        m[y][x] = int((k + 0.5) * 256 / (n * n))
+    return m
+
+
+def to_bilevel(g, cut=128):
+    """1-bit image of an 8-bit gray `g` that keeps shading visible: flat
+    mid-gray areas (table cell shading, gray box fills) become a dot screen
+    whose coverage follows their darkness (capped at 40% so black text on
+    them stays legible; lighter than 240 - 5% shading - stays white);
+    flat areas darker than 100 stay solid black (white text on them);
+    everything else - text, lines, their antialiased edges - is black when
+    darker than `cut` scaled to the lightest pixel around it (cut on
+    white), so text inside a shaded cell keeps its weight and a thin clear
+    rim instead of merging with the shading."""
+    from PIL import ImageChops, ImageFilter
+    lo, hi = g.filter(ImageFilter.MinFilter(5)), g.filter(ImageFilter.MaxFilter(5))
+    flat = ImageChops.subtract(hi, lo).point(lambda v: 255 if v < 24 else 0)
+    # strokes: darker than cut scaled to the local background (the lightest
+    # pixel around): an antialiased stroke pixel then needs the same ink
+    # coverage on a shaded cell as on white, so text keeps its weight and
+    # the shading right next to it stays clear
+    bright = g.filter(ImageFilter.MaxFilter(7))
+    ref = bright.point(lambda v, c=cut: int(v * c / 255.0))
+    ink = ImageChops.subtract(ref, g).point(lambda v: 255 if v > 0 else 0)
+    # flat areas: solid black below 100, white from 240 (5% shading and
+    # resampling ripple), dot screen between
+    def cover(v):
+        if v < 100:
+            return 255
+        if v >= 240:
+            return 0
+        return int(round(min(0.4, (240 - v) / 140.0 * 0.45) * 255))
+    want = g.point(cover)
+    n = SHADE_CELL
+    m = _screen_matrix(n)
+    tile = Image.new('L', (n, n))
+    tile.putdata([m[y][x] for y in range(n) for x in range(n)])
+    strip = Image.new('L', (g.size[0], n))
+    for x in range(0, g.size[0], n):
+        strip.paste(tile, (x, 0))
+    thr = Image.new('L', g.size)
+    for y in range(0, g.size[1], n):
+        thr.paste(strip, (0, y))
+    dots = ImageChops.subtract(want, thr).point(lambda v: 255 if v > 0 else 0)
+    black = Image.composite(dots, ink, flat)        # 255 = black
+    return black.point(lambda v: 0 if v else 255, '1')
+
+
+def _flat_mid_hist(g):
+    """Histogram of the flat (5x5 range < 24) pixels of `g` in the shading
+    band 100..239 - the pixels to_bilevel turns into a dot screen."""
+    from PIL import ImageChops, ImageFilter
+    rng = ImageChops.subtract(g.filter(ImageFilter.MaxFilter(5)),
+                              g.filter(ImageFilter.MinFilter(5)))
+    mask = ImageChops.multiply(
+        rng.point(lambda v: 255 if v < 24 else 0),
+        g.point(lambda v: 255 if 100 <= v < 240 else 0))
+    return g.histogram(mask)
+
+
+def _has_shading(g):
+    """True when flat shading covers more than 0.2% of `g`."""
+    return sum(_flat_mid_hist(g)) > 0.002 * g.size[0] * g.size[1]
+
+
+def _is_shading_not_photo(g):
+    """Mostly mid-gray image: True when its flat mid-gray pixels are a few
+    uniform fills (shaded boxes/cells: 8 gray levels hold >=80% of them),
+    False for photos and gradients (tones spread over many levels)."""
+    h = _flat_mid_hist(g)
+    n = sum(h)
+    if n < 0.3 * sum(g.histogram()[56:200]):
+        return False                  # most midtones are not flat: a photo
+    return sum(sorted(h, reverse=True)[:8]) >= 0.8 * n
 
 
 def image_report_lines(report):
@@ -2470,8 +2564,25 @@ def render_objects(src, imgdir, tables=True):
                   file=sys.stderr)
         if eqs:
             print('equations: rendered %d/%d to TIFF' % (len(eqs), n_math))
+        shaded = 0
+        for k, (tif, w_mm, h_mm) in list(tbls.items()):
+            # EqRender leaves tables in gray: make them 1-bit 300dpi G4 here
+            # with cell shading as a dot screen (cut 200 = EqRender's own
+            # threshold for text on white)
+            try:
+                g = Image.open(tif).convert('L')
+                if _has_shading(g):
+                    shaded += 1
+                to_bilevel(g, 200).save(tif, 'TIFF', compression='group4',
+                                        dpi=(G4_DPI, G4_DPI))
+            except Exception as e:
+                WARNINGS.append('표 %d 흑백 변환 실패 (%s) - 표가 텍스트 '
+                                '나열로 변환됨' % (k, type(e).__name__))
+                del tbls[k]
         if tbls:
-            print('tables: rendered %d to TIFF' % len(tbls))
+            print('tables: rendered %d to TIFF%s' % (
+                len(tbls), ' (음영 있는 표 %d개는 점무늬로)' % shaded
+                if shaded else ''))
         if n_math and (e_expect is None or len(eqs) < e_expect):
             WARNINGS.append('수식 렌더링 실패(%s) — %d개 수식이 선형 텍스트로 '
                             '변환됨. Word의 대화상자/팝업을 모두 닫고 다시 '
@@ -2717,6 +2828,53 @@ def set_pct_intl_kind(path, kind='pct'):
     print('pct: document type 03 -> %02x (%s)' % (target, label))
 
 
+# .hlt header byte 0x17 says whether the body (from 0x108) is compressed
+# (01: raw deflate, 4 KB window, + CRC32 + length trailer) or stored (00). NKEditor writes either, depending on its
+# own 압축 저장 option ([SAVE] COMPRESS in C:\KipoNet\NKEditor\NKEditer.ini),
+# so the same docx gave a 0.5 MB .hlt on one PC and 7 MB on another, with
+# identical content (only this byte, the deflate and per-run heap
+# addresses differed; verified on a Korean PCT spec, 2026-11-05).
+HLT_COMPRESS_OFFSET = 0x17
+HLT_BODY_OFFSET = 0x108
+
+
+def compress_hlt(path):
+    """Deflate a stored .hlt body in place (byte 0x17 00 -> 01), so the
+    output size no longer depends on the PC's NKEditor save option. The
+    result is checked by inflating it back before it replaces the file;
+    anything unexpected leaves the file as NKEditor wrote it."""
+    try:
+        data = open(path, 'rb').read()
+        if (not data.startswith(b'HAN Lite Document')
+                or len(data) <= HLT_BODY_OFFSET
+                or data[HLT_COMPRESS_OFFSET] != 0):
+            return
+        body = data[HLT_BODY_OFFSET:]
+        # NKEditor's layout: raw deflate with a 4 KB window (its own files
+        # inflate with wbits 12, nothing smaller) + gzip-style trailer
+        # (CRC32, uncompressed length; both u32 LE). A 32 KB-window stream
+        # makes NKEditor silently load only the first part of the document.
+        c = zlib.compressobj(9, zlib.DEFLATED, -12)
+        packed = (c.compress(body) + c.flush() +
+                  struct.pack('<II', zlib.crc32(body) & 0xFFFFFFFF,
+                              len(body) & 0xFFFFFFFF))
+        o = zlib.decompressobj(-15)
+        if (o.decompress(packed) != body or o.unused_data !=
+                packed[-8:]):
+            WARNINGS.append('.hlt 압축 확인 실패 - 압축하지 않은 채로 둠')
+            return
+        head = bytearray(data[:HLT_BODY_OFFSET])
+        head[HLT_COMPRESS_OFFSET] = 1
+        tmp = path + '.d2hz'
+        with open(tmp, 'wb') as f:
+            f.write(bytes(head) + packed)
+        os.replace(tmp, path)
+        print('hlt: 본문 압축 (NKEditor 압축 저장이 꺼져 있었음) %.1f MB -> %.1f MB'
+              % (len(data) / 1e6, (HLT_BODY_OFFSET + len(packed)) / 1e6))
+    except Exception as e:
+        WARNINGS.append('.hlt 압축 실패 (%r) - 압축하지 않은 채로 둠' % e)
+
+
 def fix_rtf(path):
     """NKEditor's RTF export can drop the root group's closing '}' (observed
     on docs with embedded images — the file ends mid-group and Word refuses
@@ -2939,6 +3097,14 @@ def convert_one(src, dst, kind=None):
                   file=sys.stderr)
             done = False
         if done:
+            # before the review export, which then also proves NKEditor
+            # reads the compressed file
+            n_w = len(WARNINGS)
+            compress_hlt(dst)
+            if len(WARNINGS) > n_w:
+                for w in WARNINGS[n_w:]:
+                    print('WARNING: %s' % w, file=sys.stderr)
+                write_report()
             # outside the try: a review-file failure (an rtf still locked by
             # the editor) used to send a finished structured .hlt down the
             # flat path, which overwrote it
@@ -2980,6 +3146,7 @@ def convert_one(src, dst, kind=None):
         print('ERROR: output not created', file=sys.stderr)
         return 1
     print('OK ->', dst)
+    compress_hlt(dst)
     # staging converted every word/media file; report only the ones the
     # body actually uses (unreferenced leftovers are not in the .hlt)
     used = set(_img_label(tgt) for _r, ims, _p in paras for (tgt, *_x) in ims)
